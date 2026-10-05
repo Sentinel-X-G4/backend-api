@@ -1,0 +1,90 @@
+# ============================================
+# .gitignore - Sentinel-X Backend API
+# ============================================
+
+# Dépendances
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Variables d'environnement (ne JAMAIS committer les vrais secrets)
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Build / Dist (si compilation un jour)
+dist/
+build/
+*.tsbuildinfo
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Tests & Coverage
+coverage/
+.nyc_output/
+*.lcov
+*.html
+
+# Docker (optionnel - décommenter si vous voulez versionner les builds)
+# Dockerfile*
+# docker-compose*.yml
+# .dockerignore
+
+# Cache divers
+.cache/
+.eslintcache
+.node_repl_history
+
+# Fichiers temporaires
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Base de données locale (SQLite, etc.)
+*.db
+*.sqlite
+*.sqlite3
+
+# Certificats / Clés (ne jamais committer)
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Profiling
+*.cpuprofile
+*.heapprofile
+
+# TypeScript (si migration future)
+*.tsbuildinfo
+
+# Misc
+*.pid
+*.seed
+*.pid.lock

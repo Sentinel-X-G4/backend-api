@@ -1,0 +1,58 @@
+# ============================================
+# Dockerfile.dev pour Sentinel-X Backend API (Développement)
+# ============================================
+
+# Image de base avec outils de développement
+FROM node:20-alpine
+
+# Métadonnées
+LABEL maintainer="Sentinel-X Team"
+LABEL description="Backend API Sentinel-X - Environnement de développement"
+LABEL version="1.0.0-dev"
+
+# Variables d'environnement
+ENV NODE_ENV=development
+ENV PORT=3000
+
+# Installer les outils nécessaires pour le développement
+# - dumb-init: gestion propre des signaux
+# - git: pour certaines dépendances npm
+RUN apk add --no-cache dumb-init git
+
+# Créer utilisateur non-root
+RUN addgroup -g 1001 -S sentinel && \
+    adduser -S sentinel -u 1001 -G sentinel
+
+WORKDIR /app
+
+# Changer propriétaire
+RUN chown -R sentinel:sentinel /app
+
+# Copier package.json en premier (cache Docker)
+COPY --chown=sentinel:sentinel package*.json ./
+
+# Installer TOUTES les dépendances (incluant devDependencies)
+RUN npm ci --legacy-peer-deps && \
+    npm cache clean --force
+
+# Copier le reste du code
+COPY --chown=sentinel:sentinel . .
+
+# Passer à l'utilisateur non-root
+USER sentinel
+
+# Exposer ports
+# 3000: API HTTP + WebSocket
+# 9229: Debugging Node.js (--inspect=0.0.0.0:9229)
+EXPOSE 3000 9229
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1
+
+# Utiliser dumb-init pour gérer les signaux correctement
+# npm run dev lance nodemon pour le hot-reload
+ENTRYPOINT ["dumb-init", "--"]
+
+# Commande par défaut (surchargée par docker-compose)
+CMD ["npm", "run", "dev"]
