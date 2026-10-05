@@ -3,16 +3,29 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const http = require('http');
 const { Server } = require('socket.io');
+const cookieParser = require('cookie-parser');
+const crypto = require('crypto');
+const helmet = require('helmet');
 
 // Chargement des variables d'environnement
 dotenv.config();
+
+// Détection de l'environnement
+const isProduction = process.env.NODE_ENV === 'production';
+
+// Origines CORS autorisées (configurable via FRONTEND_URL séparé par virgule)
+const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173')
+    .split(',')
+    .map(url => url.trim())
+    .filter(Boolean);
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: process.env.FRONTEND_URL || '*',
-        methods: ['GET', 'POST']
+        origin: allowedOrigins,
+        methods: ['GET', 'POST', 'PATCH'],
+        credentials: true
     }
 });
 
@@ -22,13 +35,100 @@ const PORT = process.env.PORT || 3000;
 const alertsStore = [];
 const MAX_ALERTS = 1000;
 
-// Middlewares
-app.use(cors({
-    origin: process.env.FRONTEND_URL || '*',
-    credentials: true
+// 1. Protection Headers & CSP (Priorité 4)
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            imgSrc: ["'self'", "data:"],
+            connectSrc: ["'self'", ...allowedOrigins, "ws:", "wss:"]
+        }
+    },
+    crossOriginResourcePolicy: { policy: 'cross-origin' }
 }));
+
+// 2. CORS Strict (Priorité 3)
+app.use(cors({
+    origin: (origin, callback) => {
+        // Autoriser les requêtes internes/CLI/curl (sans header Origin) ou si dans la whitelist
+        if (!origin || allowedOrigins.includes(origin)) {
+            return callback(null, true);
+        }
+        return callback(new Error(`Origine CORS non autorisée : ${origin}`));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token']
+}));
+
+// 3. Middlewares de parsing et Cookies (Priorité 1)
+app.use(cookieParser());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
+
+// Helper pour définir des cookies sécurisés (Priorité 1)
+const setSecureCookie = (res, name, value, options = {}) => {
+    res.cookie(name, value, {
+        httpOnly: options.httpOnly ?? true,
+        secure: isProduction,
+        sameSite: isProduction ? 'strict' : 'lax',
+        maxAge: options.maxAge || 24 * 60 * 60 * 1000, // 24h par défaut
+        path: '/',
+        ...options
+    });
+};
+
+// 4. Protection CSRF : Double-Submit Cookie Pattern (Priorité 2)
+// Fournit un token CSRF dans un cookie accessible au client front-end
+app.get('/api/v1/csrf-token', (req, res) => {
+    let csrfToken = req.cookies['XSRF-TOKEN'];
+    if (!csrfToken) {
+        csrfToken = crypto.randomBytes(32).toString('hex');
+        // Cookie lisible par JS pour que le frontend puisse l'envoyer dans X-CSRF-Token
+        res.cookie('XSRF-TOKEN', csrfToken, {
+            httpOnly: false,
+            secure: isProduction,
+            sameSite: isProduction ? 'strict' : 'lax',
+            maxAge: 24 * 60 * 60 * 1000,
+            path: '/'
+        });
+    }
+    res.status(200).json({
+        status: 'success',
+        csrfToken
+    });
+});
+
+// Middleware vérifiant le token CSRF sur les requêtes modifiant l'état (POST, PATCH, PUT, DELETE)
+const verifyCsrfToken = (req, res, next) => {
+    // Les méthodes en lecture seule sont exemptées
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+        return next();
+    }
+
+    // Autoriser les requêtes machine-to-machine via API_KEY
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey && process.env.API_KEY && apiKey === process.env.API_KEY) {
+        return next();
+    }
+
+    const cookieToken = req.cookies['XSRF-TOKEN'];
+    const headerToken = req.headers['x-csrf-token'];
+
+    if (!cookieToken || !headerToken || cookieToken !== headerToken) {
+        return res.status(403).json({
+            status: 'error',
+            message: 'Token CSRF manquant ou invalide. Requête rejetée.'
+        });
+    }
+
+    next();
+};
+
+// Application du middleware CSRF sur toutes les routes de l'API v1
+app.use('/api/v1', verifyCsrfToken);
 
 // Logger de requêtes simple
 app.use((req, res, next) => {
@@ -38,8 +138,8 @@ app.use((req, res, next) => {
 
 // Route de diagnostic simple
 app.get('/api/health', (req, res) => {
-    res.status(200).json({ 
-        status: 'OK', 
+    res.status(200).json({
+        status: 'OK',
         message: 'Backend API Sentinel-X Opérationnel',
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
@@ -50,39 +150,39 @@ app.get('/api/health', (req, res) => {
 // Validation d'une alerte
 function validateAlert(alert) {
     const errors = [];
-    
+
     if (!alert) {
         errors.push('Corps de la requête manquant');
         return errors;
     }
-    
+
     if (!alert.title || typeof alert.title !== 'string' || alert.title.trim().length === 0) {
         errors.push('Le champ "title" est requis et doit être une chaîne non vide');
     }
-    
+
     if (!alert.severity || !['low', 'medium', 'high', 'critical'].includes(alert.severity)) {
         errors.push('Le champ "severity" est requis et doit être: low, medium, high ou critical');
     }
-    
+
     if (!alert.source || typeof alert.source !== 'string' || alert.source.trim().length === 0) {
         errors.push('Le champ "source" est requis et doit être une chaîne non vide');
     }
-    
+
     if (alert.description && typeof alert.description !== 'string') {
         errors.push('Le champ "description" doit être une chaîne de caractères');
     }
-    
+
     if (alert.metadata && typeof alert.metadata !== 'object') {
         errors.push('Le champ "metadata" doit être un objet');
     }
-    
+
     return errors;
 }
 
 // Endpoint pour recevoir les alertes
 app.post('/api/v1/alerts', (req, res) => {
     const alertPayload = req.body;
-    
+
     // Validation
     const validationErrors = validateAlert(alertPayload);
     if (validationErrors.length > 0) {
@@ -93,7 +193,7 @@ app.post('/api/v1/alerts', (req, res) => {
             errors: validationErrors
         });
     }
-    
+
     // Création de l'alerte enrichie
     const newAlert = {
         id: `alert_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -105,23 +205,23 @@ app.post('/api/v1/alerts', (req, res) => {
         timestamp: new Date().toISOString(),
         acknowledged: false
     };
-    
+
     // Stockage (avec limite pour éviter les fuites mémoire)
     alertsStore.unshift(newAlert);
     if (alertsStore.length > MAX_ALERTS) {
         alertsStore.pop();
     }
-    
+
     console.log(`🚨 Nouvelle alerte [${newAlert.severity.toUpperCase()}] :`, newAlert.title);
-    
+
     // Émission WebSocket vers tous les clients connectés
     io.emit('new_alert', newAlert);
-    
+
     // Émission spécifique selon la sévérité
     io.emit(`alert_${newAlert.severity}`, newAlert);
-    
-    res.status(201).json({ 
-        status: 'success', 
+
+    res.status(201).json({
+        status: 'success',
         message: 'Alerte ingérée avec succès par l\'API',
         alert: newAlert
     });
@@ -131,20 +231,20 @@ app.post('/api/v1/alerts', (req, res) => {
 app.get('/api/v1/alerts', (req, res) => {
     try {
         let filteredAlerts = [...alertsStore];
-        
+
         // Filtre par sévérité
         if (req.query.severity) {
             const severities = req.query.severity.split(',');
             filteredAlerts = filteredAlerts.filter(a => severities.includes(a.severity));
         }
-        
+
         // Filtre par source
         if (req.query.source) {
-            filteredAlerts = filteredAlerts.filter(a => 
+            filteredAlerts = filteredAlerts.filter(a =>
                 a.source.toLowerCase().includes(req.query.source.toLowerCase())
             );
         }
-        
+
         // Filtre par date (depuis)
         if (req.query.since) {
             const sinceDate = new Date(req.query.since);
@@ -152,25 +252,25 @@ app.get('/api/v1/alerts', (req, res) => {
                 filteredAlerts = filteredAlerts.filter(a => new Date(a.timestamp) >= sinceDate);
             }
         }
-        
+
         // Recherche textuelle
         if (req.query.search) {
             const searchTerm = req.query.search.toLowerCase();
-            filteredAlerts = filteredAlerts.filter(a => 
+            filteredAlerts = filteredAlerts.filter(a =>
                 a.title.toLowerCase().includes(searchTerm) ||
                 a.description.toLowerCase().includes(searchTerm) ||
                 a.source.toLowerCase().includes(searchTerm)
             );
         }
-        
+
         // Pagination
         const page = Math.max(1, parseInt(req.query.page) || 1);
         const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
         const startIndex = (page - 1) * limit;
         const endIndex = startIndex + limit;
-        
+
         const paginatedAlerts = filteredAlerts.slice(startIndex, endIndex);
-        
+
         res.status(200).json({
             status: 'success',
             data: paginatedAlerts,
@@ -193,14 +293,14 @@ app.get('/api/v1/alerts', (req, res) => {
 // Endpoint pour récupérer une alerte spécifique
 app.get('/api/v1/alerts/:id', (req, res) => {
     const alert = alertsStore.find(a => a.id === req.params.id);
-    
+
     if (!alert) {
         return res.status(404).json({
             status: 'error',
             message: 'Alerte non trouvée'
         });
     }
-    
+
     res.status(200).json({
         status: 'success',
         data: alert
@@ -210,21 +310,21 @@ app.get('/api/v1/alerts/:id', (req, res) => {
 // Endpoint pour acquitter une alerte
 app.patch('/api/v1/alerts/:id/acknowledge', (req, res) => {
     const alertIndex = alertsStore.findIndex(a => a.id === req.params.id);
-    
+
     if (alertIndex === -1) {
         return res.status(404).json({
             status: 'error',
             message: 'Alerte non trouvée'
         });
     }
-    
+
     alertsStore[alertIndex].acknowledged = true;
     alertsStore[alertIndex].acknowledgedAt = new Date().toISOString();
     alertsStore[alertIndex].acknowledgedBy = req.body.acknowledgedBy || 'unknown';
-    
+
     // Émission WebSocket de la mise à jour
     io.emit('alert_acknowledged', alertsStore[alertIndex]);
-    
+
     res.status(200).json({
         status: 'success',
         message: 'Alerte acquittée',
@@ -246,12 +346,12 @@ app.get('/api/v1/stats', (req, res) => {
         unacknowledged: alertsStore.filter(a => !a.acknowledged).length,
         bySource: {}
     };
-    
+
     // Compter par source
     alertsStore.forEach(alert => {
         stats.bySource[alert.source] = (stats.bySource[alert.source] || 0) + 1;
     });
-    
+
     res.status(200).json({
         status: 'success',
         data: stats
@@ -261,10 +361,10 @@ app.get('/api/v1/stats', (req, res) => {
 // Gestion des connexions WebSocket
 io.on('connection', (socket) => {
     console.log(`🔌 Client WebSocket connecté: ${socket.id}`);
-    
+
     // Envoi des alertes récentes à la connexion
     socket.emit('init_alerts', alertsStore.slice(0, 50));
-    
+
     // Demande de statistiques
     socket.on('request_stats', () => {
         const stats = {
@@ -278,11 +378,11 @@ io.on('connection', (socket) => {
         };
         socket.emit('stats_update', stats);
     });
-    
+
     socket.on('disconnect', (reason) => {
         console.log(`🔌 Client WebSocket déconnecté: ${socket.id} (${reason})`);
     });
-    
+
     socket.on('error', (error) => {
         console.error(`❌ Erreur WebSocket ${socket.id}:`, error);
     });
@@ -299,7 +399,7 @@ app.use((req, res) => {
 // Middleware de gestion d'erreurs global
 app.use((err, req, res, next) => {
     console.error('❌ Erreur serveur:', err);
-    
+
     // Erreur de parsing JSON
     if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
         return res.status(400).json({
@@ -307,7 +407,7 @@ app.use((err, req, res, next) => {
             message: 'JSON invalide dans le corps de la requête'
         });
     }
-    
+
     res.status(500).json({
         status: 'error',
         message: 'Erreur interne du serveur',
@@ -318,18 +418,18 @@ app.use((err, req, res, next) => {
 // Gestion propre de l'arrêt
 const gracefulShutdown = (signal) => {
     console.log(`\n📴 Signal ${signal} reçu, arrêt en cours...`);
-    
+
     // Fermer les connexions WebSocket
     io.close(() => {
         console.log('🔌 Connexions WebSocket fermées');
     });
-    
+
     // Fermer le serveur HTTP
     server.close(() => {
         console.log('🌐 Serveur HTTP fermé');
         process.exit(0);
     });
-    
+
     // Forcer l'arrêt après 10 secondes
     setTimeout(() => {
         console.error('⏱️ Arrêt forcé après timeout');

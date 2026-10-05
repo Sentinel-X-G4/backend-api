@@ -29,14 +29,16 @@
   },
   "homepage": "https://github.com/Sentinel-X-G4/backend-api#readme",
   "dependencies": {
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
     "dotenv": "^18.0.5",
     "express": "^5.2.1",
+    "helmet": "^8.3.0",
     "socket.io": "^4.7.2"
   },
   "devDependencies": {
-    "nodemon": "^3.1.0",
-    "eslint": "^8.57.0"
+    "eslint": "^8.57.0",
+    "nodemon": "^3.1.0"
   },
   "engines": {
     "node": ">=20.0.0"
