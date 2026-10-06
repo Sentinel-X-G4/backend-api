@@ -7,6 +7,7 @@ const { Server } = require('socket.io');
 const { rateLimit } = require('express-rate-limit');
 const { createStore } = require('./db');
 const { hashPassword, verifyPassword, createSessions } = require('./auth');
+const { createVision } = require('./vision');
 
 const isProduction = process.env.NODE_ENV === 'production';
 const PORT = process.env.PORT || 3000;
@@ -62,6 +63,11 @@ const ROLES = ['admin', 'viewer'];
         console.error('❌ Création du compte admin impossible:', sanitizeForLog(err.message));
     }
 })();
+// Reconnaissance faciale : API interne du détecteur caméra (facultative)
+const vision = createVision(process.env.VISION_API_URL, process.env.VISION_API_KEY);
+if (!vision.enabled) {
+    console.warn('VISION_API_URL absente : routes /api/v1/faces et /api/v1/camera indisponibles');
+}
 
 const tooMany = (req, res) => res.status(429).json({ status: 'error', message: 'Trop de requêtes. Réessayez plus tard.' });
 const limiterOptions = { standardHeaders: 'draft-8', legacyHeaders: false, handler: tooMany };
@@ -69,7 +75,7 @@ const limiterOptions = { standardHeaders: 'draft-8', legacyHeaders: false, handl
 app.use(helmet());
 app.use(cors({
     origin: allowedOrigins,
-    methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
@@ -79,7 +85,10 @@ app.get('/api/health', (req, res) => {
 });
 
 app.use(rateLimit({ ...limiterOptions, windowMs: 15 * 60 * 1000, limit: 600 }));
-app.use(express.json({ limit: '10kb' }));
+// Seul l'ajout d'un visage transporte une image : son corps est lu après l'authentification
+const isFaceUpload = (req) => req.method === 'POST' && req.path === '/api/v1/faces';
+const smallJson = express.json({ limit: '10kb' });
+app.use((req, res, next) => (isFaceUpload(req) ? next() : smallJson(req, res, next)));
 
 // Nettoyage avant logging (anti log-injection : CR/LF/tab -> espace)
 const sanitizeForLog = (value) => String(value).replace(/[\r\n\t]+/g, ' ').slice(0, 300);
@@ -201,6 +210,50 @@ app.patch('/api/v1/alerts/:id/acknowledge', async (req, res) => {
     res.status(200).json({ status: 'success', message: 'Alerte acquittée', data: alert });
 });
 
+// --- Caméra : reconnaissance faciale (relayée vers le détecteur) ------------------------
+// Identité courante : none (personne) | authorized (personne autorisée) | unknown (inconnu)
+const relay = (res, { status, json }) => res.status(status).json(json);
+const FACE_ID = /^[0-9a-f]{32}$/;
+const checkFaceId = (req, res, next) =>
+    FACE_ID.test(req.params.id) ? next() : res.status(404).json({ status: 'error', message: 'Visage non trouvé' });
+
+app.get('/api/v1/camera', async (req, res) => relay(res, await vision.status()));
+
+app.get('/api/v1/faces', async (req, res) => relay(res, await vision.listFaces()));
+
+// { name, image? } : image en base64 (ou data URL), JPEG ou PNG. Sans image, le visage est
+// pris sur l'image courante de la caméra.
+app.post('/api/v1/faces', express.json({ limit: '8mb' }), async (req, res) => {
+    const { name, image } = req.body || {};
+    if (typeof name !== 'string' || name.trim().length === 0 || name.trim().length > 64) {
+        return res.status(400).json({ status: 'error', message: 'Le champ "name" doit être une chaîne de 1 à 64 caractères' });
+    }
+    if (image !== undefined && (typeof image !== 'string' || image.length === 0)) {
+        return res.status(400).json({ status: 'error', message: 'Le champ "image" doit être une image encodée en base64' });
+    }
+    const result = await vision.addFace(name.trim(), image);
+    if (result.status === 201) {
+        console.log(`Visage autorisé ajouté : ${sanitizeForLog(result.json.data.name)}`);
+    }
+    relay(res, result);
+});
+
+app.get('/api/v1/faces/:id/image', checkFaceId, async (req, res) => {
+    const result = await vision.faceImage(req.params.id);
+    if (!result.image) {
+        return relay(res, result);
+    }
+    res.status(200).type('image/jpeg').set('Cache-Control', 'private, no-store').send(result.image);
+});
+
+app.delete('/api/v1/faces/:id', checkFaceId, async (req, res) => {
+    const result = await vision.deleteFace(req.params.id);
+    if (result.status === 200) {
+        console.log(`Visage autorisé supprimé : ${req.params.id}`);
+    }
+    relay(res, result);
+});
+
 // États des appareils (dernier résultat du service de détection)
 app.get('/api/v1/devices', async (req, res) => {
     res.status(200).json({ status: 'success', data: await store.devices() });
@@ -225,6 +278,10 @@ io.on('connection', async (socket) => {
     try {
         socket.emit('init_alerts', await store.recentAlerts(50));
         socket.emit('init_devices', await store.devices());
+        const camera = await vision.status();
+        if (camera.status === 200) {
+            socket.emit('init_camera', camera.json.data);
+        }
     } catch (err) {
         console.error('❌ État initial indisponible:', sanitizeForLog(err.message));
     }
@@ -240,7 +297,7 @@ app.use((req, res) => {
 
 app.use((err, req, res, next) => {
     if (err.type === 'entity.too.large') {
-        return res.status(413).json({ status: 'error', message: 'Payload trop volumineux (max 10 Ko)' });
+        return res.status(413).json({ status: 'error', message: 'Payload trop volumineux' });
     }
     if (err instanceof SyntaxError && err.status === 400) {
         return res.status(400).json({ status: 'error', message: 'JSON invalide dans le corps de la requête' });
@@ -258,8 +315,12 @@ const stopListening = store.listen({
     onDevice: (device) => io.emit('device_status', device)
 });
 
+// Temps réel : changements d'identité de la caméra (none / authorized / unknown)
+const stopWatchingCamera = vision.watch((camera) => io.emit('camera_status', camera));
+
 const gracefulShutdown = (signal) => {
     console.log(`Signal ${signal} reçu, arrêt en cours...`);
+    stopWatchingCamera();
     io.close();
     server.close(() => Promise.all([stopListening(), store.close()]).finally(() => process.exit(0)));
     setTimeout(() => process.exit(1), 10000).unref();

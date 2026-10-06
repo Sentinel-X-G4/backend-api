@@ -61,6 +61,23 @@ le dépôt `database` (`db/init/`) ; l'API ne crée aucune table.
 | `NOTIFY sentinel_alerts` (id) | WebSocket `new_alert` |
 | `NOTIFY sentinel_devices` (device_id) | WebSocket `device_status` |
 
+## Caméra : reconnaissance faciale
+
+Relayée vers l'API interne du détecteur (`human-detection-ia`, réseau Docker `sentinel-vision`,
+clé partagée `VISION_API_KEY`). Le dashboard ne parle qu'au backend, avec la même clé que le reste.
+
+| Route | Rôle |
+|---|---|
+| `GET /api/v1/camera` | identité courante : `identity` = `none` (personne) \| `authorized` (personne autorisée) \| `unknown` (inconnu), `names` (autorisés reconnus), `faces` (visages vus : `name` ou `null`, `score`, `box`) |
+| `GET /api/v1/faces` | visages autorisés : `[{ id, name, created_at }]` |
+| `POST /api/v1/faces` | `{ "name": "Alice", "image": "data:image/jpeg;base64,…" }` → 201. Sans `image`, le visage est pris sur l'image courante de la caméra. 422 si l'image ne contient pas exactement un visage exploitable (≥ 40 px). Image : 6 Mo max |
+| `GET /api/v1/faces/:id/image` | vignette JPEG du visage (à charger en `fetch` + Bearer, pas en `<img src>`) |
+| `DELETE /api/v1/faces/:id` | supprime le visage |
+| WebSocket `init_camera` / `camera_status` | identité à la connexion, puis à chaque changement |
+
+Plusieurs photos sous le même `name` améliorent la reconnaissance (lumière, angle, lunettes).
+Détecteur injoignable → 503 ; clé partagée erronée → 502.
+
 ## Points d'intégration
 
 - Le service de détection et l'ESP passent par **MQTT** ; seul le service de détection y est abonné.
@@ -79,12 +96,14 @@ le dépôt `database` (`db/init/`) ; l'API ne crée aucune table.
 | `FRONTEND_URL` | origine(s) autorisée(s), séparées par des virgules. Pas de joker : `*` n'est **pas** interprété |
 | `API_KEY` | clé unique REST + WebSocket, obligatoire en production |
 | `DATABASE_URL` | `postgresql://user:pass@db:5432/sentinel`, obligatoire |
+| `VISION_API_URL` | API interne du détecteur caméra (`http://sentinel-human-detection:8090`) ; absente = routes caméra en 503 |
+| `VISION_API_KEY` | clé partagée avec le détecteur (`make vision-api-key` dans `main/`) |
 
 Dans la pile Sentinel-X, ces variables viennent du `.env` de `main/` (voir le `docker-compose.yml` de `main`, seul compose du projet) ; le backend n'a pas de `.env` propre. `npm run dev` charge `../../.env`.
 
 ## Sécurité
 
-Clé d'API obligatoire (comparée en temps constant, refus de démarrer en production si absente), frein au brute-force sur les 401, rate limiting, body limité à 10 Ko, CORS restreint, headers sécurisés (helmet), logs anti log-injection, WebSocket limité à 10 Ko, conteneur non-root.
+Clé d'API obligatoire (comparée en temps constant, refus de démarrer en production si absente), frein au brute-force sur les 401, rate limiting, body limité à 10 Ko (8 Mo pour `POST /api/v1/faces`, lu après l'authentification), CORS restreint, headers sécurisés (helmet), logs anti log-injection, WebSocket limité à 10 Ko, conteneur non-root.
 
 ## Scripts
 
