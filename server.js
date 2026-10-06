@@ -8,17 +8,11 @@ const crypto = require('crypto');
 const helmet = require('helmet');
 const { rateLimit } = require('express-rate-limit');
 
-// Chargement des variables d'environnement
 dotenv.config();
 
-// Détection de l'environnement
 const isProduction = process.env.NODE_ENV === 'production';
 
-// Origines CORS autorisées (configurable via FRONTEND_URL séparé par virgule)
-const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173')
-    .split(',')
-    .map(url => url.trim())
-    .filter(Boolean);
+const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173').split(',').map(u => u.trim()).filter(Boolean);
 
 const app = express();
 const server = http.createServer(app);
@@ -35,9 +29,6 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 3000;
 
-// Derrière le Reverse Proxy de l'organigramme, on fait confiance au 1er saut
-// pour récupérer la vraie IP cliente (indispensable au rate limiting).
-// TRUST_PROXY=false pour désactiver, '2' pour 2 sauts, 'loopback', etc.
 const trustProxyEnv = process.env.TRUST_PROXY;
 let trustProxy = 1;
 if (trustProxyEnv === 'false') {
@@ -54,7 +45,6 @@ app.disable('x-powered-by');
 const alertsStore = [];
 const MAX_ALERTS = 1000;
 
-// 1. Protection Headers & CSP (Priorité 4)
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
@@ -68,10 +58,8 @@ app.use(helmet({
     crossOriginResourcePolicy: { policy: 'cross-origin' }
 }));
 
-// 2. CORS Strict (Priorité 3)
 app.use(cors({
     origin: (origin, callback) => {
-        // Autoriser les requêtes internes/CLI/curl (sans header Origin) ou si dans la whitelist
         if (!origin || allowedOrigins.includes(origin)) {
             return callback(null, true);
         }
@@ -82,22 +70,14 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token']
 }));
 
-// 3. Middlewares de parsing et Cookies (Priorité 1)
-// - Rate limiting GLOBAL en premier : on refuse la charge avant de la parser
-// - Body limité à 100 Ko (payloads JSON d'alertes) : freine les floods par payload géant
-// - urlencoded retiré : l'API ne consomme que du JSON (surface d'attaque réduite)
 const rateLimitWindowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS, 10) || 15 * 60 * 1000;
 const globalRateMax = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS, 10) || (isProduction ? 600 : 1000);
 const ingestRateMax = parseInt(process.env.RATE_LIMIT_INGEST_MAX_REQUESTS, 10) || 60;
 
 const rateLimitHandler = (req, res) => {
-    res.status(429).json({
-        status: 'error',
-        message: 'Trop de requêtes. Réessayez plus tard.'
-    });
+    res.status(429).json({ status: 'error', message: 'Trop de requêtes. Réessayez plus tard.' });
 };
 
-// Limiteur global (le health check est exempt : healthchecks Docker/Grafana toutes les 30s)
 const globalLimiter = rateLimit({
     windowMs: rateLimitWindowMs,
     limit: globalRateMax,
@@ -107,7 +87,6 @@ const globalLimiter = rateLimit({
     handler: rateLimitHandler
 });
 
-// Limiteur dédié à l'ingestion : c'est la porte d'entrée à floodner en DoS
 const ingestLimiter = rateLimit({
     windowMs: 60 * 1000,
     limit: ingestRateMax,
@@ -120,37 +99,25 @@ app.use(globalLimiter);
 app.use(cookieParser());
 app.use(express.json({ limit: '100kb' }));
 
-// Helper pour définir des cookies sécurisés (Priorité 1)
 const setSecureCookie = (res, name, value, options = {}) => {
     res.cookie(name, value, {
         httpOnly: options.httpOnly ?? true,
         secure: isProduction,
         sameSite: isProduction ? 'strict' : 'lax',
-        maxAge: options.maxAge || 24 * 60 * 60 * 1000, // 24h par défaut
+        maxAge: options.maxAge || 24 * 60 * 60 * 1000,
         path: '/',
         ...options
     });
 };
 
-// 4. Protection CSRF : Double-Submit Cookie Pattern (Priorité 2)
-// Fournit un token CSRF dans un cookie accessible au client front-end
 app.get('/api/v1/csrf-token', (req, res) => {
     let csrfToken = req.cookies['XSRF-TOKEN'];
     if (!csrfToken) {
         csrfToken = crypto.randomBytes(32).toString('hex');
-        // Cookie lisible par JS pour que le frontend puisse l'envoyer dans X-CSRF-Token
-        setSecureCookie(res, 'XSRF-TOKEN', csrfToken, {
-            httpOnly: false
-        });
+        setSecureCookie(res, 'XSRF-TOKEN', csrfToken, { httpOnly: false });
     }
-    res.status(200).json({
-        status: 'success',
-        csrfToken
-    });
-});
-
-// Comparaison en temps constant (anti attaque de timing sur les secrets)
-const timingSafeEquals = (a, b) => {
+    res.status(200).json({ status: 'success', csrfToken });
+});const timingSafeEquals = (a, b) => {
     const bufA = Buffer.from(String(a), 'utf8');
     const bufB = Buffer.from(String(b), 'utf8');
     if (bufA.length !== bufB.length) {
@@ -159,20 +126,15 @@ const timingSafeEquals = (a, b) => {
     return crypto.timingSafeEqual(bufA, bufB);
 };
 
-// Middleware vérifiant le token CSRF sur les requêtes modifiant l'état (POST, PATCH, PUT, DELETE)
 const verifyCsrfToken = (req, res, next) => {
-    // L'ingestion M2M (POST /alerts) est protégée par API key, pas par CSRF :
-    // un client sans clé recevra un vrai 401 d'authentification
     if (req.method === 'POST' && req.path === '/alerts') {
         return next();
     }
 
-    // Les méthodes en lecture seule sont exemptées
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
         return next();
     }
 
-    // Autoriser les requêtes machine-to-machine via API_KEY
     const apiKey = req.headers['x-api-key'];
     if (apiKey && process.env.API_KEY && timingSafeEquals(apiKey, process.env.API_KEY)) {
         return next();
@@ -191,17 +153,13 @@ const verifyCsrfToken = (req, res, next) => {
     next();
 };
 
-// Application du middleware CSRF sur toutes les routes de l'API v1
 app.use('/api/v1', verifyCsrfToken);
 
-// Logger de requêtes (CR/LF neutralisés : anti log-injection via URL/corps)
 app.use((req, res, next) => {
-    const safePath = String(req.path).replace(/[\r\n]+/g, '');
-    console.log(`[${new Date().toISOString()}] ${req.method} ${safePath}`);
+    console.log(`[${new Date().toISOString()}] ${req.method} ${String(req.path).replace(/[\r\n]+/g, '')}`);
     next();
 });
 
-// Route de diagnostic simple
 app.get('/api/health', (req, res) => {
     res.status(200).json({
         status: 'OK',
@@ -293,8 +251,6 @@ function validateAlert(alert) {
     return errors;
 }
 
-// Authentification machine-to-machine de l'ingestion (Backend IoT -> API).
-// Échec en production si API_KEY non configurée (fail-closed), ouverte en dev uniquement.
 const requireApiKey = (req, res, next) => {
     const provided = req.headers['x-api-key'];
     const expected = process.env.API_KEY;
@@ -322,14 +278,12 @@ const requireApiKey = (req, res, next) => {
     next();
 };
 
-// Endpoint pour recevoir les alertes (rate limité + authentifié par X-API-Key)
 app.post('/api/v1/alerts', ingestLimiter, requireApiKey, (req, res) => {
     const alertPayload = req.body;
 
-    // Validation
     const validationErrors = validateAlert(alertPayload);
     if (validationErrors.length > 0) {
-        console.warn('❌ Alerte invalide reçue:', validationErrors.map(sanitizeForLog));
+        console.warn('Alerte invalide reçue:', validationErrors.map(sanitizeForLog));
         return res.status(400).json({
             status: 'error',
             message: 'Données d\'alerte invalides',
@@ -337,7 +291,6 @@ app.post('/api/v1/alerts', ingestLimiter, requireApiKey, (req, res) => {
         });
     }
 
-    // Création de l'alerte enrichie
     const newAlert = {
         id: `alert_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
         title: alertPayload.title.trim(),
@@ -349,46 +302,38 @@ app.post('/api/v1/alerts', ingestLimiter, requireApiKey, (req, res) => {
         acknowledged: false
     };
 
-    // Stockage (avec limite pour éviter les fuites mémoire)
     alertsStore.unshift(newAlert);
     if (alertsStore.length > MAX_ALERTS) {
         alertsStore.pop();
     }
 
-    console.log(`🚨 Nouvelle alerte [${newAlert.severity.toUpperCase()}] :`, sanitizeForLog(newAlert.title));
+    console.log(`Nouvelle alerte [${newAlert.severity.toUpperCase()}] :`, sanitizeForLog(newAlert.title));
 
-    // Émission WebSocket vers tous les clients connectés
     io.emit('new_alert', newAlert);
-
-    // Émission spécifique selon la sévérité
     io.emit(`alert_${newAlert.severity}`, newAlert);
 
     res.status(201).json({
         status: 'success',
-        message: 'Alerte ingérée avec succès par l\'API',
+        message: 'Alerte ingérée', 
         alert: newAlert
     });
 });
 
-// Endpoint pour récupérer les alertes (avec filtres)
 app.get('/api/v1/alerts', (req, res) => {
     try {
         let filteredAlerts = [...alertsStore];
 
-        // Filtre par sévérité
         if (req.query.severity) {
             const severities = req.query.severity.split(',');
             filteredAlerts = filteredAlerts.filter(a => severities.includes(a.severity));
         }
 
-        // Filtre par source
         if (req.query.source) {
             filteredAlerts = filteredAlerts.filter(a =>
                 a.source.toLowerCase().includes(req.query.source.toLowerCase())
             );
         }
 
-        // Filtre par date (depuis)
         if (req.query.since) {
             const sinceDate = new Date(req.query.since);
             if (!isNaN(sinceDate.getTime())) {
@@ -396,7 +341,6 @@ app.get('/api/v1/alerts', (req, res) => {
             }
         }
 
-        // Recherche textuelle
         if (req.query.search) {
             const searchTerm = req.query.search.toLowerCase();
             filteredAlerts = filteredAlerts.filter(a =>
@@ -406,7 +350,6 @@ app.get('/api/v1/alerts', (req, res) => {
             );
         }
 
-        // Pagination
         const page = Math.max(1, parseInt(req.query.page) || 1);
         const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
         const startIndex = (page - 1) * limit;
@@ -426,42 +369,27 @@ app.get('/api/v1/alerts', (req, res) => {
         });
     } catch (error) {
         console.error('Erreur lors de la récupération des alertes:', error);
-        res.status(500).json({
-            status: 'error',
-            message: 'Erreur interne du serveur'
-        });
+        res.status(500).json({ status: 'error', message: 'Erreur interne du serveur' });
     }
 });
 
-// Endpoint pour récupérer une alerte spécifique
 app.get('/api/v1/alerts/:id', (req, res) => {
     const alert = alertsStore.find(a => a.id === req.params.id);
 
     if (!alert) {
-        return res.status(404).json({
-            status: 'error',
-            message: 'Alerte non trouvée'
-        });
+        return res.status(404).json({ status: 'error', message: 'Alerte non trouvée' });
     }
 
-    res.status(200).json({
-        status: 'success',
-        data: alert
-    });
+    res.status(200).json({ status: 'success', data: alert });
 });
 
-// Endpoint pour acquitter une alerte
 app.patch('/api/v1/alerts/:id/acknowledge', (req, res) => {
     const alertIndex = alertsStore.findIndex(a => a.id === req.params.id);
 
     if (alertIndex === -1) {
-        return res.status(404).json({
-            status: 'error',
-            message: 'Alerte non trouvée'
-        });
+        return res.status(404).json({ status: 'error', message: 'Alerte non trouvée' });
     }
 
-    // Validation de l'identifiant d'acquittement (aucune écriture arbitraille)
     const { acknowledgedBy } = req.body || {};
     if (acknowledgedBy !== undefined && (typeof acknowledgedBy !== 'string' || acknowledgedBy.trim().length === 0 || acknowledgedBy.trim().length > 100)) {
         return res.status(400).json({
@@ -474,7 +402,6 @@ app.patch('/api/v1/alerts/:id/acknowledge', (req, res) => {
     alertsStore[alertIndex].acknowledgedAt = new Date().toISOString();
     alertsStore[alertIndex].acknowledgedBy = acknowledgedBy ? acknowledgedBy.trim() : 'unknown';
 
-    // Émission WebSocket de la mise à jour
     io.emit('alert_acknowledged', alertsStore[alertIndex]);
 
     res.status(200).json({
@@ -484,7 +411,6 @@ app.patch('/api/v1/alerts/:id/acknowledge', (req, res) => {
     });
 });
 
-// Endpoint pour les statistiques
 app.get('/api/v1/stats', (req, res) => {
     const stats = {
         total: alertsStore.length,
@@ -499,25 +425,18 @@ app.get('/api/v1/stats', (req, res) => {
         bySource: {}
     };
 
-    // Compter par source
     alertsStore.forEach(alert => {
         stats.bySource[alert.source] = (stats.bySource[alert.source] || 0) + 1;
     });
 
-    res.status(200).json({
-        status: 'success',
-        data: stats
-    });
+    res.status(200).json({ status: 'success', data: stats });
 });
 
-// Gestion des connexions WebSocket
 io.on('connection', (socket) => {
-    console.log(`🔌 Client WebSocket connecté: ${socket.id}`);
+    console.log(`Client WebSocket connecté: ${socket.id}`);
 
-    // Envoi des alertes récentes à la connexion
     socket.emit('init_alerts', alertsStore.slice(0, 50));
 
-    // Demande de statistiques
     socket.on('request_stats', () => {
         const stats = {
             total: alertsStore.length,
@@ -532,48 +451,31 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', (reason) => {
-        console.log(`🔌 Client WebSocket déconnecté: ${socket.id} (${reason})`);
+        console.log(`Client WebSocket déconnecté: ${socket.id} (${reason})`);
     });
 
     socket.on('error', (error) => {
-        console.error(`❌ Erreur WebSocket ${socket.id}:`, error);
+        console.error(`Erreur WebSocket ${socket.id}:`, error);
     });
 });
 
-// Middleware de gestion d'erreurs 404
 app.use((req, res) => {
-    res.status(404).json({
-        status: 'error',
-        message: `Route ${req.method} ${req.path} non trouvée`
-    });
+    res.status(404).json({ status: 'error', message: `Route ${req.method} ${req.path} non trouvée` });
 });
 
-// Middleware de gestion d'erreurs global
 app.use((err, req, res, next) => {
-    // Rejet CORS : origine non whitelistée -> 403 explicite (et pas une 500)
     if (err && typeof err.message === 'string' && err.message.startsWith('Origine CORS non autorisée')) {
-        return res.status(403).json({
-            status: 'error',
-            message: 'Origine non autorisée'
-        });
+        return res.status(403).json({ status: 'error', message: 'Origine non autorisée' });
     }
 
-    // Payload trop volumineux (body limit 100 Ko)
     if (err && err.type === 'entity.too.large') {
-        return res.status(413).json({
-            status: 'error',
-            message: 'Payload trop volumeneux (max 100 Ko)'
-        });
+        return res.status(413).json({ status: 'error', message: 'Payload trop voluméux (max 100 Ko)' });
     }
 
-    console.error('❌ Erreur serveur:', sanitizeForLog(err && err.message ? err.message : err));
+    console.error('Erreur serveur:', sanitizeForLog(err && err.message ? err.message : err));
 
-    // Erreur de parsing JSON
     if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
-        return res.status(400).json({
-            status: 'error',
-            message: 'JSON invalide dans le corps de la requête'
-        });
+        return res.status(400).json({ status: 'error', message: 'JSON invalide dans le corps de la requête' });
     }
 
     res.status(500).json({
@@ -583,24 +485,17 @@ app.use((err, req, res, next) => {
     });
 });
 
-// Gestion propre de l'arrêt
 const gracefulShutdown = (signal) => {
-    console.log(`\n📴 Signal ${signal} reçu, arrêt en cours...`);
-
-    // Fermer les connexions WebSocket
+    console.log(`Signal ${signal} reçu, arrêt en cours...`);
     io.close(() => {
-        console.log('🔌 Connexions WebSocket fermées');
+        console.log('Connexions WebSocket fermées');
     });
-
-    // Fermer le serveur HTTP
     server.close(() => {
-        console.log('🌐 Serveur HTTP fermé');
+        console.log('Serveur HTTP fermé');
         process.exit(0);
     });
-
-    // Forcer l'arrêt après 10 secondes
     setTimeout(() => {
-        console.error('⏱️ Arrêt forcé après timeout');
+        console.error('Arrêt forcé après timeout');
         process.exit(1);
     }, 10000);
 };
@@ -608,25 +503,20 @@ const gracefulShutdown = (signal) => {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// Gestion des erreurs non capturées
 process.on('uncaughtException', (err) => {
-    console.error('❌ Exception non capturée:', err);
+    console.error('Exception non capturée:', err);
     gracefulShutdown('uncaughtException');
 });
 
 process.on('unhandledRejection', (reason, _promise) => {
-    console.error('❌ Promesse rejetée non gérée:', reason);
+    console.error('Promesse rejetée non gérée:', reason);
 });
 
-// Lancement du serveur
 server.listen(PORT, () => {
-    console.log(`\n╔══════════════════════════════════════════╗`);
-    console.log(`║  🛡️  Sentinel-X Backend API v1.0.0      ║`);
-    console.log(`╠══════════════════════════════════════════╣`);
-    console.log(`║  🌐 Serveur HTTP:  http://localhost:${PORT}    ║`);
-    console.log(`║  🔌 WebSocket:     ws://localhost:${PORT}    ║`);
-    console.log(`║  📡 Health check:  GET /api/health      ║`);
-    console.log(`║  🚨 Alertes:       POST /api/v1/alerts  ║`);
-    console.log(`║  📊 Stats:         GET /api/v1/stats    ║`);
-    console.log(`╚══════════════════════════════════════════╝\n`);
+    console.log(`Serveur HTTP: http://localhost:${PORT}`);
+    console.log(`WebSocket: ws://localhost:${PORT}`);
+    console.log(`Health check: GET /api/health`);
+    console.log(`Alertes: POST /api/v1/alerts`);
+    console.log(`Stats: GET /api/v1/stats`);
 });
+
