@@ -60,9 +60,10 @@ USER sentinel
 # Exposer le port HTTP et WebSocket
 EXPOSE 3000
 
-# Health check pour Docker
+# Health check pour Docker : sur $PORT (forme shell, évaluée à l'exécution), car le
+# compose parent lance l'API sur 5678 (port attendu par le reverse proxy)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1
+    CMD wget --no-verbose --tries=1 --spider "http://localhost:${PORT}/api/health" || exit 1
 
 # Point d'entrée
 # Utilise 'node' directement (pas 'npm start' pour éviter un processus shell supplémentaire)
