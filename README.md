@@ -74,34 +74,23 @@ Le backend peut être exécuté de manière 100% autonome via Docker, sans front
 
 ### 2. Démarrage du conteneur en mode autonome (sans frontend)
 
-Comme vous n'avez pas de frontend, on autorise toutes les origines avec `FRONTEND_URL="*"` (ou en l'omettant car c'est la valeur par défaut de l'API) :
+Comme tu n'as pas encore de frontend, on autorise toutes les origines avec `FRONTEND_URL="*"`
+(ou en l'omettant car c'est la valeur par défaut de l'API).
 
-#### Sous Windows PowerShell :
-```powershell
-docker run -d `
-  --name sentinel-x-backend `
-  -p 3000:3000 `
-  -e NODE_ENV=production `
-  -e PORT=3000 `
-  -e FRONTEND_URL="*" `
-  sentinel-x-backend
-```
+**Ta commande en une ligne — production, backend seul, sans frontend :**
 
-#### Sous Linux / macOS / Git Bash :
 ```bash
-docker run -d \
-  --name sentinel-x-backend \
-  -p 3000:3000 \
-  -e NODE_ENV=production \
-  -e PORT=3000 \
-  -e FRONTEND_URL="*" \
-  sentinel-x-backend
+docker run -d --name sentinel-x-backend -p 3000:3000 -e NODE_ENV=production -e PORT=3000 -e FRONTEND_URL="*" -e API_KEY="<toi-cle-secrete>" sentinel-x-backend
 ```
 
-> **Avec fichier `.env`** : Si vous préférez utiliser votre fichier `.env` :
-> ```powershell
-> docker run -d --name sentinel-x-backend -p 3000:3000 --env-file backend-api/.env sentinel-x-backend
-> ```
+**Avec fichier `.env`** : Si tu préfères utiliser ton fichier `.env` (il doit contenir au moins `API_KEY` en prod) :
+```bash
+docker run -d --name sentinel-x-backend -p 3000:3000 --env-file backend-api/.env sentinel-x-backend
+```
+ou directement dans backend-api : 
+```
+docker run -d --name sentinel-x-backend -p 3000:3000 --env-file .env sentinel-x-backend
+```
 
 ---
 
@@ -316,19 +305,3 @@ backend-api/
 |----------|-------|
 | `GET /api/health` | Liveness/Readiness probe (K8s, Docker, LB) |
 | `GET /api/v1/stats` | Métriques métier pour Grafana/Datadog |
-
----
-
-## 🤝 Contribution
-
-1. Fork le repo
-2. Créez une branche (`git checkout -b feature/ma-fonctionnalite`)
-3. Committez (`git commit -m 'feat: ajouter ...'`)
-4. Push (`git push origin feature/ma-fonctionnalite`)
-5. Ouvrez une Pull Request
-
----
-
-## 📄 Licence
-
-ISC - Voir le fichier [LICENSE](../LICENSE) à la racine du projet.
