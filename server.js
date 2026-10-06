@@ -7,6 +7,7 @@ const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
 const helmet = require('helmet');
 const { rateLimit } = require('express-rate-limit');
+const { startMqttBridge } = require('./mqtt-bridge');
 
 dotenv.config();
 
@@ -44,6 +45,8 @@ app.disable('x-powered-by');
 // Stockage en mémoire des alertes (remplacer par une DB en production)
 const alertsStore = [];
 const MAX_ALERTS = 1000;
+// Dernier résultat du service de détection par appareil (reçu en MQTT)
+const devicesState = new Map();
 
 app.use(helmet({
     contentSecurityPolicy: {
@@ -278,19 +281,8 @@ const requireApiKey = (req, res, next) => {
     next();
 };
 
-app.post('/api/v1/alerts', ingestLimiter, requireApiKey, (req, res) => {
-    const alertPayload = req.body;
-
-    const validationErrors = validateAlert(alertPayload);
-    if (validationErrors.length > 0) {
-        console.warn('Alerte invalide reçue:', validationErrors.map(sanitizeForLog));
-        return res.status(400).json({
-            status: 'error',
-            message: 'Données d\'alerte invalides',
-            errors: validationErrors
-        });
-    }
-
+// Création, stockage et diffusion d'une alerte (HTTP ou MQTT)
+function ingestAlert(alertPayload) {
     const newAlert = {
         id: `alert_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
         title: alertPayload.title.trim(),
@@ -312,9 +304,27 @@ app.post('/api/v1/alerts', ingestLimiter, requireApiKey, (req, res) => {
     io.emit('new_alert', newAlert);
     io.emit(`alert_${newAlert.severity}`, newAlert);
 
+    return newAlert;
+}
+
+app.post('/api/v1/alerts', ingestLimiter, requireApiKey, (req, res) => {
+    const alertPayload = req.body;
+
+    const validationErrors = validateAlert(alertPayload);
+    if (validationErrors.length > 0) {
+        console.warn('Alerte invalide reçue:', validationErrors.map(sanitizeForLog));
+        return res.status(400).json({
+            status: 'error',
+            message: 'Données d\'alerte invalides',
+            errors: validationErrors
+        });
+    }
+
+    const newAlert = ingestAlert(alertPayload);
+
     res.status(201).json({
         status: 'success',
-        message: 'Alerte ingérée', 
+        message: 'Alerte ingérée',
         alert: newAlert
     });
 });
@@ -411,6 +421,14 @@ app.patch('/api/v1/alerts/:id/acknowledge', (req, res) => {
     });
 });
 
+// États des appareils (dernier résultat de détection reçu en MQTT)
+app.get('/api/v1/devices', (req, res) => {
+    res.status(200).json({
+        status: 'success',
+        data: Object.fromEntries(devicesState)
+    });
+});
+
 app.get('/api/v1/stats', (req, res) => {
     const stats = {
         total: alertsStore.length,
@@ -436,6 +454,7 @@ io.on('connection', (socket) => {
     console.log(`Client WebSocket connecté: ${socket.id}`);
 
     socket.emit('init_alerts', alertsStore.slice(0, 50));
+    socket.emit('init_devices', Object.fromEntries(devicesState));
 
     socket.on('request_stats', () => {
         const stats = {
@@ -487,6 +506,9 @@ app.use((err, req, res, next) => {
 
 const gracefulShutdown = (signal) => {
     console.log(`Signal ${signal} reçu, arrêt en cours...`);
+
+    if (mqttClient) mqttClient.end();
+
     io.close(() => {
         console.log('Connexions WebSocket fermées');
     });
@@ -511,6 +533,9 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason, _promise) => {
     console.error('Promesse rejetée non gérée:', reason);
 });
+
+// Pont MQTT (alertes du service de détection et de l'ESP)
+const mqttClient = startMqttBridge({ ingestAlert, io, devices: devicesState });
 
 server.listen(PORT, () => {
     console.log(`Serveur HTTP: http://localhost:${PORT}`);
