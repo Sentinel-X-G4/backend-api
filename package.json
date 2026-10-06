@@ -33,7 +33,7 @@
     "express": "^5.2.1",
     "express-rate-limit": "^8.7.0",
     "helmet": "^8.3.0",
-    "mqtt": "^5.16.0",
+    "pg": "^8.23.1",
     "socket.io": "^4.7.2"
   },
   "devDependencies": {

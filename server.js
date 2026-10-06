@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const helmet = require('helmet');
 const { Server } = require('socket.io');
 const { rateLimit } = require('express-rate-limit');
-const { startMqttBridge } = require('./mqtt-bridge');
+const { createStore } = require('./db');
 
 const isProduction = process.env.NODE_ENV === 'production';
 const PORT = process.env.PORT || 3000;
@@ -20,6 +20,12 @@ if (isProduction && (!API_KEY || API_KEY.length < 32)) {
 }
 if (!API_KEY) {
     console.warn('[SÉCURITÉ] API_KEY absente : API ouverte (développement uniquement)');
+}
+
+// Toutes les données viennent de la base (écrite par le service de détection)
+if (!process.env.DATABASE_URL) {
+    console.error('DATABASE_URL absente : arrêt');
+    process.exit(1);
 }
 
 const sha256 = (value) => crypto.createHash('sha256').update(String(value)).digest();
@@ -37,10 +43,7 @@ const io = new Server(server, {
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
 
-const alertsStore = [];
-const MAX_ALERTS = 1000;
-// Dernier résultat du service de détection par appareil (reçu en MQTT)
-const devicesState = new Map();
+const store = createStore(process.env.DATABASE_URL);
 
 const tooMany = (req, res) => res.status(429).json({ status: 'error', message: 'Trop de requêtes. Réessayez plus tard.' });
 const limiterOptions = { standardHeaders: 'draft-8', legacyHeaders: false, handler: tooMany };
@@ -86,87 +89,38 @@ app.use('/api/v1', authFailureLimiter, (req, res, next) => {
     res.status(401).json({ status: 'error', message: 'Authentification requise' });
 });
 
-// Création, stockage et diffusion d'une alerte (appelée par le pont MQTT, données déjà bornées)
-function ingestAlert({ title, severity, source, description = '', metadata = {} }) {
-    const newAlert = {
-        id: crypto.randomUUID(),
-        title: String(title).slice(0, 200),
-        severity,
-        source: String(source).slice(0, 100),
-        description: String(description).slice(0, 2000),
-        metadata,
-        timestamp: new Date().toISOString(),
-        acknowledged: false
-    };
-
-    alertsStore.unshift(newAlert);
-    if (alertsStore.length > MAX_ALERTS) {
-        alertsStore.pop();
-    }
-
-    console.log(`Nouvelle alerte [${newAlert.severity.toUpperCase()}] :`, sanitizeForLog(newAlert.title));
-    io.emit('new_alert', newAlert);
-    return newAlert;
-}
-
-const SEVERITIES = ['critical', 'high', 'medium', 'low'];
-
-const computeStats = () => {
-    const stats = {
-        total: alertsStore.length,
-        acknowledged: 0,
-        unacknowledged: 0,
-        bySeverity: Object.fromEntries(SEVERITIES.map(s => [s, 0])),
-        bySource: {}
-    };
-    for (const alert of alertsStore) {
-        stats[alert.acknowledged ? 'acknowledged' : 'unacknowledged']++;
-        stats.bySeverity[alert.severity]++;
-        stats.bySource[alert.source] = (stats.bySource[alert.source] || 0) + 1;
-    }
-    return stats;
-};
-
 // Un paramètre répété (?a=1&a=2) arrive sous forme de tableau : on ne garde que les chaînes
 const queryString = (value) => (typeof value === 'string' ? value : '');
 
-app.get('/api/v1/alerts', (req, res) => {
-    const severities = queryString(req.query.severity).split(',').filter(Boolean);
-    const source = queryString(req.query.source).toLowerCase();
-    const search = queryString(req.query.search).toLowerCase();
+app.get('/api/v1/alerts', async (req, res) => {
     const since = new Date(queryString(req.query.since));
-
-    const filtered = alertsStore.filter(a =>
-        (severities.length === 0 || severities.includes(a.severity)) &&
-        (!source || a.source.toLowerCase().includes(source)) &&
-        (isNaN(since.getTime()) || new Date(a.timestamp) >= since) &&
-        (!search || [a.title, a.description, a.source].some(f => f.toLowerCase().includes(search)))
-    );
+    const filters = {
+        severities: queryString(req.query.severity).split(',').filter(Boolean),
+        source: queryString(req.query.source).toLowerCase(),
+        search: queryString(req.query.search).toLowerCase(),
+        since: isNaN(since.getTime()) ? null : since
+    };
 
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    const { data, total } = await store.listAlerts(filters, { offset: (page - 1) * limit, limit });
 
     res.status(200).json({
         status: 'success',
-        data: filtered.slice((page - 1) * limit, page * limit),
-        pagination: { page, limit, total: filtered.length, totalPages: Math.ceil(filtered.length / limit) }
+        data,
+        pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
     });
 });
 
-app.get('/api/v1/alerts/:id', (req, res) => {
-    const alert = alertsStore.find(a => a.id === req.params.id);
+app.get('/api/v1/alerts/:id', async (req, res) => {
+    const alert = await store.getAlert(req.params.id);
     if (!alert) {
         return res.status(404).json({ status: 'error', message: 'Alerte non trouvée' });
     }
     res.status(200).json({ status: 'success', data: alert });
 });
 
-app.patch('/api/v1/alerts/:id/acknowledge', (req, res) => {
-    const alert = alertsStore.find(a => a.id === req.params.id);
-    if (!alert) {
-        return res.status(404).json({ status: 'error', message: 'Alerte non trouvée' });
-    }
-
+app.patch('/api/v1/alerts/:id/acknowledge', async (req, res) => {
     const { acknowledgedBy } = req.body || {};
     if (acknowledgedBy !== undefined && (typeof acknowledgedBy !== 'string' || acknowledgedBy.trim().length === 0 || acknowledgedBy.trim().length > 100)) {
         return res.status(400).json({
@@ -175,21 +129,22 @@ app.patch('/api/v1/alerts/:id/acknowledge', (req, res) => {
         });
     }
 
-    alert.acknowledged = true;
-    alert.acknowledgedAt = new Date().toISOString();
-    alert.acknowledgedBy = acknowledgedBy ? acknowledgedBy.trim() : 'unknown';
+    const alert = await store.acknowledgeAlert(req.params.id, acknowledgedBy ? acknowledgedBy.trim() : 'unknown');
+    if (!alert) {
+        return res.status(404).json({ status: 'error', message: 'Alerte non trouvée' });
+    }
 
     io.emit('alert_acknowledged', alert);
     res.status(200).json({ status: 'success', message: 'Alerte acquittée', data: alert });
 });
 
-// États des appareils (dernier résultat de détection reçu en MQTT)
-app.get('/api/v1/devices', (req, res) => {
-    res.status(200).json({ status: 'success', data: Object.fromEntries(devicesState) });
+// États des appareils (dernier résultat du service de détection)
+app.get('/api/v1/devices', async (req, res) => {
+    res.status(200).json({ status: 'success', data: await store.devices() });
 });
 
-app.get('/api/v1/stats', (req, res) => {
-    res.status(200).json({ status: 'success', data: computeStats() });
+app.get('/api/v1/stats', async (req, res) => {
+    res.status(200).json({ status: 'success', data: await store.stats() });
 });
 
 // WebSocket : même clé que l'API REST, passée par le client (io({ auth: { token } }))
@@ -201,10 +156,14 @@ io.use((socket, next) => {
     next(new Error('Authentification requise'));
 });
 
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
     console.log(`Client WebSocket connecté: ${socket.id}`);
-    socket.emit('init_alerts', alertsStore.slice(0, 50));
-    socket.emit('init_devices', Object.fromEntries(devicesState));
+    try {
+        socket.emit('init_alerts', await store.recentAlerts(50));
+        socket.emit('init_devices', await store.devices());
+    } catch (err) {
+        console.error('❌ État initial indisponible:', sanitizeForLog(err.message));
+    }
 
     socket.on('disconnect', (reason) => {
         console.log(`Client WebSocket déconnecté: ${socket.id} (${reason})`);
@@ -226,14 +185,19 @@ app.use((err, req, res, next) => {
     res.status(500).json({ status: 'error', message: 'Erreur interne du serveur' });
 });
 
-// Pont MQTT (alertes du service de détection et de l'ESP)
-const mqttClient = startMqttBridge({ ingestAlert, io, devices: devicesState });
+// Temps réel : nouvelles alertes et états d'appareils écrits en base par le service de détection
+const stopListening = store.listen({
+    onAlert: (alert) => {
+        console.log(`Nouvelle alerte [${alert.severity.toUpperCase()}] :`, sanitizeForLog(alert.title));
+        io.emit('new_alert', alert);
+    },
+    onDevice: (device) => io.emit('device_status', device)
+});
 
 const gracefulShutdown = (signal) => {
     console.log(`Signal ${signal} reçu, arrêt en cours...`);
-    if (mqttClient) mqttClient.end();
     io.close();
-    server.close(() => process.exit(0));
+    server.close(() => Promise.all([stopListening(), store.close()]).finally(() => process.exit(0)));
     setTimeout(() => process.exit(1), 10000).unref();
 };
 
