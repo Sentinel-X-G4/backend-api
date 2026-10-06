@@ -14,6 +14,7 @@ const mqtt = require('mqtt');
 const DETECTION_TOPIC = 'sentinelx/+/detection';
 const ESP_ALERT_TOPIC = 'sentinelx/+/alert';
 
+const DEVICE_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const SEVERITY = { feu: 'critical', fuite_gaz: 'critical', presence: 'high' };
 const TITLES = { feu: 'Incendie détecté', fuite_gaz: 'Fuite de gaz détectée', presence: 'Présence détectée' };
 
@@ -51,6 +52,10 @@ function startMqttBridge({ ingestAlert, io, devices }) {
             console.warn(`❌ JSON invalide sur ${topic}`);
             return;
         }
+        if (!DEVICE_ID.test(deviceId) || !payload || typeof payload !== 'object' || Array.isArray(payload)) {
+            console.warn(`❌ Message ignoré sur ${topic}`);
+            return;
+        }
         if (kind === 'detection') onDetection(deviceId, payload);
         else if (kind === 'alert') onEspAlert(deviceId, payload);
     });
@@ -60,14 +65,16 @@ function startMqttBridge({ ingestAlert, io, devices }) {
         devices.set(deviceId, payload);
         io.emit('device_status', payload);
 
+        const alerts = Array.isArray(payload.alerts) ? payload.alerts : [];
         const wasActive = new Set((previous?.alerts || []).filter(a => a.active).map(a => a.type));
-        for (const alert of payload.alerts || []) {
-            if (!alert.active || wasActive.has(alert.type)) continue;
+        for (const alert of alerts) {
+            if (!alert || !alert.active || typeof alert.type !== 'string' || wasActive.has(alert.type)) continue;
+            const confidence = Number.isFinite(alert.confidence) ? Math.round(alert.confidence * 100) : '?';
             ingestAlert({
                 title: `${TITLES[alert.type] || alert.type} (${deviceId})`,
                 severity: SEVERITY[alert.type] || 'medium',
                 source: `detection-service/${deviceId}`,
-                description: `Confiance ${Math.round(alert.confidence * 100)} %, origine : ${alert.source === 'rule' ? 'règle de sécurité' : 'modèle'}`,
+                description: `Confiance ${confidence} %, origine : ${alert.source === 'rule' ? 'règle de sécurité' : 'modèle'}`,
                 metadata: { device_id: deviceId, type: alert.type, since: alert.since,
                             model_version: payload.model_version, metrics: payload.metrics }
             });
@@ -75,12 +82,13 @@ function startMqttBridge({ ingestAlert, io, devices }) {
     }
 
     function onEspAlert(deviceId, payload) {
-        if (!payload || !payload.type || payload.value === false) return;
+        if (typeof payload.type !== 'string' || !payload.type || payload.value === false) return;
         ingestAlert({
             title: `Alerte capteur ${payload.type} (${deviceId})`,
             severity: 'medium',
             source: `esp/${deviceId}`,
-            metadata: { device_id: deviceId, ...payload }
+            // Champs choisis un par un : le contenu du message ne doit pas écraser device_id
+            metadata: { device_id: deviceId, type: payload.type.slice(0, 64), value: typeof payload.value === 'object' ? null : payload.value }
         });
     }
 

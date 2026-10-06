@@ -6,7 +6,8 @@ Backend API pour le système de surveillance SENTINEL-X. Expose une API REST + W
 
 - **Pont MQTT** (`mqtt-bridge.js`) : abonné en MQTTS aux résultats du service de détection et aux
   alertes de l'ESP ; c'est le chemin normal des alertes dans la pile Sentinel-X.
-- **POST /api/v1/alerts** : ingestion HTTP d'une alerte (outils, intégrations). Requiert le header `X-API-Key`.
+- **Authentification** : toute l'API (`/api/v1/*` et WebSocket) exige `API_KEY` en `Authorization: Bearer <clé>`
+  (WebSocket : `io({ auth: { token } })`). Seul `GET /api/health` est public.
 - **Health check** : `GET /api/health` pour la supervision du conteneur.
 - **WebSocket** : push temps réel vers le frontend (Dashboard).
 
@@ -22,7 +23,7 @@ Backend API pour le système de surveillance SENTINEL-X. Expose une API REST + W
 ```bash
 cd backend-api
 npm ci
-cp .env.example .env
+# la configuration vient du .env de main/ (make init), le backend n'a pas de .env propre
 npm run dev
 ```
 
@@ -34,14 +35,14 @@ Depuis la racine du projet :
 
 ```bash
 docker build -f backend-api/Dockerfile -t sentinel-x-backend backend-api
-docker run -d --name sentinel-x-backend -p 3000:3000 -e NODE_ENV=production -e PORT=3000 -e FRONTEND_URL="http://localhost:5173" -e API_KEY="<votre-cle-secrete>" sentinel-x-backend
+docker run -d --name sentinel-x-backend -p 3000:3000 -e NODE_ENV=production -e FRONTEND_URL="http://localhost:5173" -e API_KEY="$(openssl rand -hex 32)" sentinel-x-backend
 ```
 
 Depuis `backend-api/` :
 
 ```bash
 docker build -t sentinel-x-backend .
-docker run -d --name sentinel-x-backend -p 3000:3000 --env-file .env sentinel-x-backend
+docker run -d --name sentinel-x-backend -p 3000:3000 --env-file ../../.env sentinel-x-backend
 ```
 
 Pour arrêter et supprimer : `docker stop sentinel-x-backend && docker rm sentinel-x-backend`.
@@ -56,35 +57,32 @@ dans la pile Sentinel-X (droits : `sentinel-x-g4/infra/mosquitto/config/acl`).
 | `sentinelx/+/detection` | résultat du service de détection : état de l'appareil (`GET /api/v1/devices`, WebSocket `device_status`) et alerte créée à l'**activation** de `feu`, `fuite_gaz` ou `presence` |
 | `sentinelx/+/alert` | alerte brute de l'ESP, ex. `{"type":"pir","value":true}` |
 
-Les alertes reçues en MQTT suivent le même chemin que celles du POST (stockage, `new_alert` en
-WebSocket), sans passer par la validation HTTP.
+Les messages MQTT sont validés (identifiant d'appareil, types) avant stockage et diffusion `new_alert`.
 
 ## Points d'intégration
 
-- Le service de détection et l'ESP passent par **MQTT**, pas par `POST /api/v1/alerts`.
-- `POST /api/v1/alerts` demande `X-API-Key` : sans `API_KEY` configurée, il répond 503 en production.
-- Écritures du dashboard (`PATCH`…) : jeton CSRF à lire sur `GET /api/v1/csrf-token`, à renvoyer
-  dans le header `X-CSRF-Token` (avec le cookie `XSRF-TOKEN`).
+- Le service de détection et l'ESP passent par **MQTT**.
+- Il n'y a plus d'ingestion HTTP : les alertes n'arrivent que par MQTT.
+- Sans `API_KEY` (32 caractères minimum), l'API refuse de démarrer en production.
 - Le health check est accessible à `GET /api/health` pour le reverse proxy et la supervision.
 - WebSocket : chemin socket.io par défaut (`/socket.io/`), relayé au backend par le reverse proxy.
   Il hérite du CORS : `FRONTEND_URL` doit contenir l'origine exacte du dashboard.
 - Il n'y a pas encore de persistance : l'historique est en mémoire (perdu au redémarrage).
 
-## Variables d'environnement (voir .env.example)
+## Variables d'environnement (`.env` de `main/`, voir `main/.env.example`)
 
 | Variable | Rôle |
 |---|---|
 | `PORT` | port HTTP (3000 ; 5678 dans la pile Sentinel-X, attendu par le reverse proxy) |
 | `FRONTEND_URL` | origine(s) autorisée(s), séparées par des virgules. Pas de joker : `*` n'est **pas** interprété |
-| `API_KEY` | clé de `POST /api/v1/alerts`, obligatoire en production |
+| `API_KEY` | clé unique REST + WebSocket, obligatoire en production |
 | `MQTT_URL`, `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_CA_FILE` | pont MQTT (vide = désactivé) |
-| `TRUST_PROXY`, `RATE_LIMIT_*` | reverse proxy et limites de débit |
 
-PostgreSQL, Redis et JWT sont pour plus tard.
+Dans la pile Sentinel-X, ces variables viennent du `.env` de `main/` (voir `docker-compose.yml`) ; le backend n'a pas de `.env` propre. `npm run dev` charge `../../.env`.
 
 ## Sécurité
 
-La surface d'attaque est réduite : validation stricte des payloads (whitelist de champs, limites de taille, blocage des clés dangereuses), auth ingestion par `X-API-Key` comparée en temps constant (fail-closed en prod si absente), rate limiting, body limité à 100 Ko, CORS restreint, headers sécurisés (helmet, X-Powered-By désactivé), logs anti log-injection, WebSocket limité à 10 Ko, conteneur non-root.
+Clé d'API obligatoire (comparée en temps constant, refus de démarrer en production si absente), frein au brute-force sur les 401, rate limiting, body limité à 10 Ko, CORS restreint, headers sécurisés (helmet), logs anti log-injection, WebSocket limité à 10 Ko, conteneur non-root.
 
 ## Scripts
 
