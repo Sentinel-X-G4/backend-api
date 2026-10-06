@@ -25,7 +25,7 @@ Backend API pour le système de surveillance SENTINEL-X. Expose une API REST + W
 cd backend-api
 npm ci
 # la configuration vient du .env de main/ (make init), le backend n'a pas de .env propre ;
-# DATABASE_URL doit pointer vers une base accessible (dans la pile, sentinel-db n'est pas exposée)
+# DATABASE_URL doit pointer vers une base accessible (dans la pile, la base backend_db n'est pas exposée)
 npm run dev
 ```
 
@@ -52,7 +52,7 @@ Pour arrêter et supprimer : `docker stop sentinel-x-backend && docker rm sentin
 ## Base de données
 
 `DATABASE_URL` est obligatoire (l'API refuse de démarrer sans). Le schéma est créé par
-`sentinel-x-g4/infra/postgres/init/` ; l'API ne crée aucune table.
+le dépôt `backend_db` (`db/init/`) ; l'API ne crée aucune table.
 
 | Source | Usage |
 |---|---|
@@ -78,9 +78,9 @@ Pour arrêter et supprimer : `docker stop sentinel-x-backend && docker rm sentin
 | `PORT` | port HTTP (3000 ; 5678 dans la pile Sentinel-X, attendu par le reverse proxy) |
 | `FRONTEND_URL` | origine(s) autorisée(s), séparées par des virgules. Pas de joker : `*` n'est **pas** interprété |
 | `API_KEY` | clé unique REST + WebSocket, obligatoire en production |
-| `DATABASE_URL` | `postgresql://user:pass@sentinel-db:5432/sentinel`, obligatoire |
+| `DATABASE_URL` | `postgresql://user:pass@db:5432/sentinel`, obligatoire |
 
-Dans la pile Sentinel-X, ces variables viennent du `.env` de `main/` (voir `docker-compose.yml`) ; le backend n'a pas de `.env` propre. `npm run dev` charge `../../.env`.
+Dans la pile Sentinel-X, ces variables viennent du `.env` de `main/` (voir le `docker-compose.yml` de `main`, seul compose du projet) ; le backend n'a pas de `.env` propre. `npm run dev` charge `../../.env`.
 
 ## Sécurité
 

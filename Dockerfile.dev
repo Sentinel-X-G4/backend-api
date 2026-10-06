@@ -54,5 +54,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
 # npm run dev lance nodemon pour le hot-reload
 ENTRYPOINT ["dumb-init", "--"]
 
-# Commande par défaut (surchargée par docker-compose)
+# Commande par défaut
 CMD ["npm", "run", "dev"]

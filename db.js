@@ -1,13 +1,13 @@
 // ============================================
-// Accès à la base Sentinel-X (PostgreSQL / TimescaleDB de l'infra)
+// Accès à la base Sentinel-X (dépôt backend_db : PostgreSQL / TimescaleDB)
 // ============================================
 // L'API ne parle pas à MQTT : le service de détection (backend-iot-alerts) écoute le broker
 // et écrit en base ; l'API lit, acquitte, et relaie le temps réel en WebSocket.
 //   public.alerts          alertes (écrites par le service de détection)
 //   detection.predictions  dernier état de chaque appareil
-// Temps réel : triggers NOTIFY de l'infra (postgres/init/03-notify.sql), canaux
+// Temps réel : triggers NOTIFY de backend_db (db/init/03_notify.sql), canaux
 // « sentinel_alerts » (payload = id) et « sentinel_devices » (payload = device_id).
-// Le schéma est créé par l'infra : l'API ne crée aucune table.
+// Le schéma est créé par backend_db (db/init/) : l'API ne crée aucune table.
 
 const { Client, Pool } = require('pg');
 
