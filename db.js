@@ -175,6 +175,28 @@ function createStore(connectionString) {
             );
             return Object.fromEntries(rows.map(r => [r.device_id, toDevice(r)]));
         },
+        // Comptes du dashboard (table users)
+        async getUser(username) {
+            const { rows } = await pool.query('SELECT username, password_hash, role FROM users WHERE username = $1', [username]);
+            return rows[0] || null;
+        },
+        async listUsers() {
+            const { rows } = await pool.query('SELECT id, username, role FROM users ORDER BY id');
+            return rows;
+        },
+        async countUsers() {
+            const { rows } = await pool.query('SELECT count(*)::int AS n FROM users');
+            return rows[0].n;
+        },
+        // -> { id, username, role } ou null si l'identifiant existe déjà
+        async createUser(username, passwordHash, role) {
+            const { rows } = await pool.query(
+                `INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3)
+                 ON CONFLICT (username) DO NOTHING RETURNING id, username, role`,
+                [username, passwordHash, role]
+            );
+            return rows[0] || null;
+        },
         async ping() {
             await pool.query('SELECT 1');
         },

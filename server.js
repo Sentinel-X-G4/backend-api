@@ -6,6 +6,7 @@ const helmet = require('helmet');
 const { Server } = require('socket.io');
 const { rateLimit } = require('express-rate-limit');
 const { createStore } = require('./db');
+const { hashPassword, verifyPassword, createSessions } = require('./auth');
 
 const isProduction = process.env.NODE_ENV === 'production';
 const PORT = process.env.PORT || 3000;
@@ -44,6 +45,23 @@ app.set('trust proxy', 1);
 app.disable('x-powered-by');
 
 const store = createStore(process.env.DATABASE_URL);
+const sessions = createSessions(API_KEY);
+const ROLES = ['admin', 'viewer'];
+
+// Premier démarrage : crée le compte admin depuis ADMIN_USERNAME / ADMIN_PASSWORD si aucun compte n'existe
+(async () => {
+    const password = process.env.ADMIN_PASSWORD;
+    if (!password) return;
+    try {
+        if (await store.countUsers() === 0) {
+            const username = process.env.ADMIN_USERNAME || 'admin';
+            await store.createUser(username, hashPassword(password), 'admin');
+            console.log(`Compte admin initial créé : ${sanitizeForLog(username)}`);
+        }
+    } catch (err) {
+        console.error('❌ Création du compte admin impossible:', sanitizeForLog(err.message));
+    }
+})();
 
 const tooMany = (req, res) => res.status(429).json({ status: 'error', message: 'Trop de requêtes. Réessayez plus tard.' });
 const limiterOptions = { standardHeaders: 'draft-8', legacyHeaders: false, handler: tooMany };
@@ -51,7 +69,7 @@ const limiterOptions = { standardHeaders: 'draft-8', legacyHeaders: false, handl
 app.use(helmet());
 app.use(cors({
     origin: allowedOrigins,
-    methods: ['GET', 'PATCH', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
@@ -80,13 +98,58 @@ const authFailureLimiter = rateLimit({
     requestWasSuccessful: (req, res) => res.statusCode !== 401
 });
 
+// Connexion : publique (frein au brute-force via authFailureLimiter), renvoie un jeton de session
+app.post('/api/v1/auth/login', authFailureLimiter, async (req, res) => {
+    const { username, password } = req.body || {};
+    const user = typeof username === 'string' && typeof password === 'string' ? await store.getUser(username) : null;
+    if (!user || !verifyPassword(password, user.password_hash)) {
+        return res.status(401).json({ status: 'error', message: 'Identifiant ou mot de passe incorrect' });
+    }
+    const account = { username: user.username, role: user.role };
+    res.status(200).json({ status: 'success', data: { token: sessions.issue(account), user: account } });
+});
+
+// Accès : clé API (services) ou jeton de session (utilisateurs du dashboard)
 app.use('/api/v1', authFailureLimiter, (req, res, next) => {
     const [scheme, token] = (req.headers.authorization || '').split(' ');
-    if (scheme === 'Bearer' && isAuthorized(token)) {
-        return next();
+    if (scheme === 'Bearer') {
+        const user = sessions.verify(token);
+        if (user) {
+            req.user = user;
+            return next();
+        }
+        if (isAuthorized(token)) {
+            return next();
+        }
     }
     console.warn(`[SÉCURITÉ] Accès refusé (ip=${req.ip})`);
     res.status(401).json({ status: 'error', message: 'Authentification requise' });
+});
+
+// Gestion des comptes : réservée aux admins
+const requireAdmin = (req, res, next) =>
+    req.user?.role === 'admin' ? next() : res.status(403).json({ status: 'error', message: 'Droits administrateur requis' });
+
+app.get('/api/v1/users', requireAdmin, async (req, res) => {
+    res.status(200).json({ status: 'success', data: await store.listUsers() });
+});
+
+app.post('/api/v1/users', requireAdmin, async (req, res) => {
+    const { username, password, role } = req.body || {};
+    if (typeof username !== 'string' || !/^[\w.@-]{3,50}$/.test(username)) {
+        return res.status(400).json({ status: 'error', message: 'Identifiant invalide (3 à 50 caractères : lettres, chiffres, . _ @ -)' });
+    }
+    if (typeof password !== 'string' || password.length < 8 || password.length > 200) {
+        return res.status(400).json({ status: 'error', message: 'Mot de passe : 8 caractères minimum' });
+    }
+    if (!ROLES.includes(role)) {
+        return res.status(400).json({ status: 'error', message: `Rôle invalide (${ROLES.join(', ')})` });
+    }
+    const user = await store.createUser(username, hashPassword(password), role);
+    if (!user) {
+        return res.status(409).json({ status: 'error', message: 'Cet identifiant existe déjà' });
+    }
+    res.status(201).json({ status: 'success', data: user });
 });
 
 // Un paramètre répété (?a=1&a=2) arrive sous forme de tableau : on ne garde que les chaînes
@@ -149,7 +212,8 @@ app.get('/api/v1/stats', async (req, res) => {
 
 // WebSocket : même clé que l'API REST, passée par le client (io({ auth: { token } }))
 io.use((socket, next) => {
-    if (isAuthorized(socket.handshake.auth?.token)) {
+    const token = socket.handshake.auth?.token;
+    if (sessions.verify(token) || isAuthorized(token)) {
         return next();
     }
     console.warn(`[SÉCURITÉ] WebSocket refusé (ip=${socket.handshake.address})`);
