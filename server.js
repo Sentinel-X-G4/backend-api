@@ -6,6 +6,7 @@ const { Server } = require('socket.io');
 const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
 const helmet = require('helmet');
+const { rateLimit } = require('express-rate-limit');
 
 // Chargement des variables d'environnement
 dotenv.config();
@@ -26,10 +27,28 @@ const io = new Server(server, {
         origin: allowedOrigins,
         methods: ['GET', 'POST', 'PATCH'],
         credentials: true
-    }
+    },
+    // Durcissement WS : 10 Ko max par message entrant (les clients n'envoient
+    // que des événements légers type request_stats)
+    maxHttpBufferSize: 10000
 });
 
 const PORT = process.env.PORT || 3000;
+
+// Derrière le Reverse Proxy de l'organigramme, on fait confiance au 1er saut
+// pour récupérer la vraie IP cliente (indispensable au rate limiting).
+// TRUST_PROXY=false pour désactiver, '2' pour 2 sauts, 'loopback', etc.
+const trustProxyEnv = process.env.TRUST_PROXY;
+let trustProxy = 1;
+if (trustProxyEnv === 'false') {
+    trustProxy = false;
+} else if (trustProxyEnv !== undefined && trustProxyEnv !== 'true') {
+    trustProxy = /^\d+$/.test(trustProxyEnv) ? Number(trustProxyEnv) : trustProxyEnv;
+}
+app.set('trust proxy', trustProxy);
+
+// Ne pas exposer la version de framework (fuite d'information)
+app.disable('x-powered-by');
 
 // Stockage en mémoire des alertes (remplacer par une DB en production)
 const alertsStore = [];
@@ -64,9 +83,42 @@ app.use(cors({
 }));
 
 // 3. Middlewares de parsing et Cookies (Priorité 1)
+// - Rate limiting GLOBAL en premier : on refuse la charge avant de la parser
+// - Body limité à 100 Ko (payloads JSON d'alertes) : freine les floods par payload géant
+// - urlencoded retiré : l'API ne consomme que du JSON (surface d'attaque réduite)
+const rateLimitWindowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS, 10) || 15 * 60 * 1000;
+const globalRateMax = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS, 10) || (isProduction ? 600 : 1000);
+const ingestRateMax = parseInt(process.env.RATE_LIMIT_INGEST_MAX_REQUESTS, 10) || 60;
+
+const rateLimitHandler = (req, res) => {
+    res.status(429).json({
+        status: 'error',
+        message: 'Trop de requêtes. Réessayez plus tard.'
+    });
+};
+
+// Limiteur global (le health check est exempt : healthchecks Docker/Grafana toutes les 30s)
+const globalLimiter = rateLimit({
+    windowMs: rateLimitWindowMs,
+    limit: globalRateMax,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    skip: (req) => req.path === '/api/health',
+    handler: rateLimitHandler
+});
+
+// Limiteur dédié à l'ingestion : c'est la porte d'entrée à floodner en DoS
+const ingestLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: ingestRateMax,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    handler: rateLimitHandler
+});
+
+app.use(globalLimiter);
 app.use(cookieParser());
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '100kb' }));
 
 // Helper pour définir des cookies sécurisés (Priorité 1)
 const setSecureCookie = (res, name, value, options = {}) => {
@@ -87,12 +139,8 @@ app.get('/api/v1/csrf-token', (req, res) => {
     if (!csrfToken) {
         csrfToken = crypto.randomBytes(32).toString('hex');
         // Cookie lisible par JS pour que le frontend puisse l'envoyer dans X-CSRF-Token
-        res.cookie('XSRF-TOKEN', csrfToken, {
-            httpOnly: false,
-            secure: isProduction,
-            sameSite: isProduction ? 'strict' : 'lax',
-            maxAge: 24 * 60 * 60 * 1000,
-            path: '/'
+        setSecureCookie(res, 'XSRF-TOKEN', csrfToken, {
+            httpOnly: false
         });
     }
     res.status(200).json({
@@ -101,8 +149,24 @@ app.get('/api/v1/csrf-token', (req, res) => {
     });
 });
 
+// Comparaison en temps constant (anti attaque de timing sur les secrets)
+const timingSafeEquals = (a, b) => {
+    const bufA = Buffer.from(String(a), 'utf8');
+    const bufB = Buffer.from(String(b), 'utf8');
+    if (bufA.length !== bufB.length) {
+        return false;
+    }
+    return crypto.timingSafeEqual(bufA, bufB);
+};
+
 // Middleware vérifiant le token CSRF sur les requêtes modifiant l'état (POST, PATCH, PUT, DELETE)
 const verifyCsrfToken = (req, res, next) => {
+    // L'ingestion M2M (POST /alerts) est protégée par API key, pas par CSRF :
+    // un client sans clé recevra un vrai 401 d'authentification
+    if (req.method === 'POST' && req.path === '/alerts') {
+        return next();
+    }
+
     // Les méthodes en lecture seule sont exemptées
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
         return next();
@@ -110,7 +174,7 @@ const verifyCsrfToken = (req, res, next) => {
 
     // Autoriser les requêtes machine-to-machine via API_KEY
     const apiKey = req.headers['x-api-key'];
-    if (apiKey && process.env.API_KEY && apiKey === process.env.API_KEY) {
+    if (apiKey && process.env.API_KEY && timingSafeEquals(apiKey, process.env.API_KEY)) {
         return next();
     }
 
@@ -130,9 +194,10 @@ const verifyCsrfToken = (req, res, next) => {
 // Application du middleware CSRF sur toutes les routes de l'API v1
 app.use('/api/v1', verifyCsrfToken);
 
-// Logger de requêtes simple
+// Logger de requêtes (CR/LF neutralisés : anti log-injection via URL/corps)
 app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+    const safePath = String(req.path).replace(/[\r\n]+/g, '');
+    console.log(`[${new Date().toISOString()}] ${req.method} ${safePath}`);
     next();
 });
 
@@ -147,17 +212,34 @@ app.get('/api/health', (req, res) => {
     });
 });
 
-// Validation d'une alerte
+// Nettoyage des chaînes avant logging (anti log-injection : CR/LF -> espace)
+const sanitizeForLog = (value) => String(value).replace(/[\r\n\t]+/g, ' ').slice(0, 300);
+
+// Clés interdites : pollution de prototype / accès protégé
+const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+// Validation stricte d'une alerte :
+// - whitelist de champs (anti mass-assignment : acknowledged, id, timestamp...)
+// - limites de taille sur chaque champ
+// - metadata : objet plat à valeurs scalaires uniquement (anti injection / pollution de prototype)
 function validateAlert(alert) {
     const errors = [];
 
-    if (!alert) {
-        errors.push('Corps de la requête manquant');
+    if (!alert || typeof alert !== 'object' || Array.isArray(alert)) {
+        errors.push('Le corps de la requête doit être un objet JSON');
         return errors;
+    }
+
+    const allowedFields = ['title', 'severity', 'source', 'description', 'metadata'];
+    const unknownFields = Object.keys(alert).filter((key) => !allowedFields.includes(key));
+    if (unknownFields.length > 0) {
+        errors.push(`Champs non autorisés : ${unknownFields.join(', ')}`);
     }
 
     if (!alert.title || typeof alert.title !== 'string' || alert.title.trim().length === 0) {
         errors.push('Le champ "title" est requis et doit être une chaîne non vide');
+    } else if (alert.title.length > 200) {
+        errors.push('Le champ "title" ne peut pas dépasser 200 caractères');
     }
 
     if (!alert.severity || !['low', 'medium', 'high', 'critical'].includes(alert.severity)) {
@@ -166,27 +248,88 @@ function validateAlert(alert) {
 
     if (!alert.source || typeof alert.source !== 'string' || alert.source.trim().length === 0) {
         errors.push('Le champ "source" est requis et doit être une chaîne non vide');
+    } else if (alert.source.length > 100) {
+        errors.push('Le champ "source" ne peut pas dépasser 100 caractères');
     }
 
-    if (alert.description && typeof alert.description !== 'string') {
-        errors.push('Le champ "description" doit être une chaîne de caractères');
+    if (alert.description !== undefined && alert.description !== null) {
+        if (typeof alert.description !== 'string') {
+            errors.push('Le champ "description" doit être une chaîne de caractères');
+        } else if (alert.description.length > 2000) {
+            errors.push('Le champ "description" ne peut pas dépasser 2000 caractères');
+        }
     }
 
-    if (alert.metadata && typeof alert.metadata !== 'object') {
-        errors.push('Le champ "metadata" doit être un objet');
+    if (alert.metadata !== undefined && alert.metadata !== null) {
+        if (typeof alert.metadata !== 'object' || Array.isArray(alert.metadata)) {
+            errors.push('Le champ "metadata" doit être un objet JSON');
+        } else {
+            const keys = Object.keys(alert.metadata);
+            if (keys.length > 10) {
+                errors.push('Le champ "metadata" ne peut pas contenir plus de 10 clés');
+            }
+            for (const key of keys) {
+                if (DANGEROUS_KEYS.has(key)) {
+                    errors.push(`Clé interdite dans "metadata" : ${sanitizeForLog(key)}`);
+                    continue;
+                }
+                if (!/^[A-Za-z0-9_.-]{1,64}$/.test(key)) {
+                    errors.push(`Clé invalide dans "metadata" : ${sanitizeForLog(key)}`);
+                    continue;
+                }
+                const value = alert.metadata[key];
+                const isScalar = value === null || ['string', 'number', 'boolean'].includes(typeof value);
+                if (!isScalar) {
+                    errors.push(`La valeur de "metadata.${key}" doit être un scalaire (string, number, boolean ou null)`);
+                } else if (typeof value === 'string' && value.length > 512) {
+                    errors.push(`La valeur de "metadata.${key}" ne peut pas dépasser 512 caractères`);
+                } else if (typeof value === 'number' && !Number.isFinite(value)) {
+                    errors.push(`La valeur de "metadata.${key}" doit être un nombre fini`);
+                }
+            }
+        }
     }
 
     return errors;
 }
 
-// Endpoint pour recevoir les alertes
-app.post('/api/v1/alerts', (req, res) => {
+// Authentification machine-to-machine de l'ingestion (Backend IoT -> API).
+// Échec en production si API_KEY non configurée (fail-closed), ouverte en dev uniquement.
+const requireApiKey = (req, res, next) => {
+    const provided = req.headers['x-api-key'];
+    const expected = process.env.API_KEY;
+
+    if (!expected) {
+        if (isProduction) {
+            console.error('[SÉCURITÉ] API_KEY absente : ingestion refusée (fail-closed)');
+            return res.status(503).json({
+                status: 'error',
+                message: 'Service d\'ingestion non configuré'
+            });
+        }
+        console.warn('[SÉCURITÉ] API_KEY absente : ingestion ouverte (mode développement uniquement)');
+        return next();
+    }
+
+    if (!provided || !timingSafeEquals(provided, expected)) {
+        console.warn(`[SÉCURITÉ] Ingestion refusée : API key invalide (ip=${req.ip}, ua=${sanitizeForLog(req.headers['user-agent'] || '-')})`);
+        return res.status(401).json({
+            status: 'error',
+            message: 'API key manquante ou invalide'
+        });
+    }
+
+    next();
+};
+
+// Endpoint pour recevoir les alertes (rate limité + authentifié par X-API-Key)
+app.post('/api/v1/alerts', ingestLimiter, requireApiKey, (req, res) => {
     const alertPayload = req.body;
 
     // Validation
     const validationErrors = validateAlert(alertPayload);
     if (validationErrors.length > 0) {
-        console.warn('❌ Alerte invalide reçue:', validationErrors);
+        console.warn('❌ Alerte invalide reçue:', validationErrors.map(sanitizeForLog));
         return res.status(400).json({
             status: 'error',
             message: 'Données d\'alerte invalides',
@@ -212,7 +355,7 @@ app.post('/api/v1/alerts', (req, res) => {
         alertsStore.pop();
     }
 
-    console.log(`🚨 Nouvelle alerte [${newAlert.severity.toUpperCase()}] :`, newAlert.title);
+    console.log(`🚨 Nouvelle alerte [${newAlert.severity.toUpperCase()}] :`, sanitizeForLog(newAlert.title));
 
     // Émission WebSocket vers tous les clients connectés
     io.emit('new_alert', newAlert);
@@ -318,9 +461,18 @@ app.patch('/api/v1/alerts/:id/acknowledge', (req, res) => {
         });
     }
 
+    // Validation de l'identifiant d'acquittement (aucune écriture arbitraille)
+    const { acknowledgedBy } = req.body || {};
+    if (acknowledgedBy !== undefined && (typeof acknowledgedBy !== 'string' || acknowledgedBy.trim().length === 0 || acknowledgedBy.trim().length > 100)) {
+        return res.status(400).json({
+            status: 'error',
+            message: 'Le champ "acknowledgedBy" doit être une chaîne de 1 à 100 caractères'
+        });
+    }
+
     alertsStore[alertIndex].acknowledged = true;
     alertsStore[alertIndex].acknowledgedAt = new Date().toISOString();
-    alertsStore[alertIndex].acknowledgedBy = req.body.acknowledgedBy || 'unknown';
+    alertsStore[alertIndex].acknowledgedBy = acknowledgedBy ? acknowledgedBy.trim() : 'unknown';
 
     // Émission WebSocket de la mise à jour
     io.emit('alert_acknowledged', alertsStore[alertIndex]);
@@ -398,7 +550,23 @@ app.use((req, res) => {
 
 // Middleware de gestion d'erreurs global
 app.use((err, req, res, next) => {
-    console.error('❌ Erreur serveur:', err);
+    // Rejet CORS : origine non whitelistée -> 403 explicite (et pas une 500)
+    if (err && typeof err.message === 'string' && err.message.startsWith('Origine CORS non autorisée')) {
+        return res.status(403).json({
+            status: 'error',
+            message: 'Origine non autorisée'
+        });
+    }
+
+    // Payload trop volumineux (body limit 100 Ko)
+    if (err && err.type === 'entity.too.large') {
+        return res.status(413).json({
+            status: 'error',
+            message: 'Payload trop volumeneux (max 100 Ko)'
+        });
+    }
+
+    console.error('❌ Erreur serveur:', sanitizeForLog(err && err.message ? err.message : err));
 
     // Erreur de parsing JSON
     if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
@@ -446,7 +614,7 @@ process.on('uncaughtException', (err) => {
     gracefulShutdown('uncaughtException');
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason, _promise) => {
     console.error('❌ Promesse rejetée non gérée:', reason);
 });
 
