@@ -64,7 +64,7 @@ const createVision = (baseUrl, apiKey, previewUrl = baseUrl && previewFrom(baseU
         enabled,
         status: () => call('/status'),
         listFaces: () => call('/faces'),
-        addFace: (name, image) => call('/faces', { method: 'POST', body: { name, ...(image && { image }) } }),
+        addFace: (name) => call('/faces', { method: 'POST', body: { name } }),
         faceImage: (id) => call(`/faces/${id}/image`),
         deleteFace: (id) => call(`/faces/${id}`, { method: 'DELETE' }),
         snapshot

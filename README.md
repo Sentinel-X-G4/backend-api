@@ -106,12 +106,12 @@ clé partagée `VISION_API_KEY`). Le dashboard ne parle qu'au backend, avec la m
 |---|---|
 | `GET /api/v1/camera` | identité courante : `identity` = `none` (personne) \| `authorized` (personne autorisée) \| `unknown` (inconnu), `names` (autorisés reconnus), `faces` (visages vus : `name` ou `null`, `score`, `box`) |
 | `GET /api/v1/faces` | visages autorisés : `[{ id, name, created_at }]` |
-| `POST /api/v1/faces` | `{ "name": "Alice", "image": "data:image/jpeg;base64,…" }` → 201. Sans `image`, le visage est pris sur l'image courante de la caméra. 422 si l'image ne contient pas exactement un visage exploitable (≥ 40 px). Image : 6 Mo max |
+| `POST /api/v1/faces` | `{ "name": "Alice" }` → 201. Le détecteur prend le visage sur l'image courante de la caméra Sentinel : le backend ne reçoit aucune image. 422 s'il n'y a pas exactement un visage exploitable (≥ 40 px) |
 | `GET /api/v1/faces/:id/image` | vignette JPEG du visage (à charger en `fetch` + Bearer, pas en `<img src>`) |
 | `DELETE /api/v1/faces/:id` | supprime le visage |
 | `GET /api/v1/camera/snapshot` | dernière image JPEG annotée de la webcam (détecteur, port 8089 ; `VISION_PREVIEW_URL` pour changer). Le dashboard la redemande chaque seconde |
 
-Plusieurs photos sous le même `name` améliorent la reconnaissance (lumière, angle, lunettes).
+Plusieurs captures sous le même `name` améliorent la reconnaissance (lumière, angle, lunettes).
 Détecteur injoignable → 503 ; clé partagée erronée → 502.
 
 ## Points d'intégration
@@ -140,7 +140,7 @@ Dans la pile Sentinel-X, ces variables viennent du `.env` de `main/` (voir le `d
 
 ## Sécurité
 
-Clé d'API obligatoire (comparée en temps constant, refus de démarrer en production si absente), frein au brute-force sur les 401, rate limiting (600 requêtes par minute et par IP), body limité à 10 Ko (8 Mo pour `POST /api/v1/faces`, lu après l'authentification), CORS restreint, headers sécurisés (helmet), logs anti log-injection, conteneur non-root.
+Clé d'API obligatoire (comparée en temps constant, refus de démarrer en production si absente), frein au brute-force sur les 401, rate limiting (600 requêtes par minute et par IP), body limité à 10 Ko, CORS restreint, headers sécurisés (helmet), logs anti log-injection, conteneur non-root.
 
 ## Scripts
 

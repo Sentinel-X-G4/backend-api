@@ -92,10 +92,7 @@ app.get('/api/health', (req, res) => {
 
 // 10 requêtes/s par IP (comme nginx) : le dashboard interroge l'API en continu (voir frontend live.jsx)
 app.use(rateLimit({ ...limiterOptions, windowMs: 60 * 1000, limit: 600 }));
-// Seul l'ajout d'un visage transporte une image : son corps est lu après l'authentification
-const isFaceUpload = (req) => req.method === 'POST' && req.path === '/api/v1/faces';
-const smallJson = express.json({ limit: '10kb' });
-app.use((req, res, next) => (isFaceUpload(req) ? next() : smallJson(req, res, next)));
+app.use(express.json({ limit: '10kb' }));
 
 // Nettoyage avant logging (anti log-injection : CR/LF/tab -> espace)
 const sanitizeForLog = (value) => String(value).replace(/[\r\n\t]+/g, ' ').slice(0, 300);
@@ -349,20 +346,16 @@ const FACE_FORBIDDEN = { status: 'error', message: 'Ce visage est lié à un com
 
 app.get('/api/v1/faces', allow(...ADMINS), async (req, res) => relay(res, await vision.listFaces()));
 
-// { name, image? } : image en base64 (ou data URL), JPEG ou PNG. Sans image, le visage est
-// pris sur l'image courante de la caméra.
-app.post('/api/v1/faces', allow(...ADMINS), express.json({ limit: '8mb' }), async (req, res) => {
-    const { name, image } = req.body || {};
+// { name } : le détecteur prend lui-même le visage sur l'image courante de la caméra Sentinel
+app.post('/api/v1/faces', allow(...ADMINS), async (req, res) => {
+    const { name } = req.body || {};
     if (typeof name !== 'string' || name.trim().length === 0 || name.trim().length > 64) {
         return res.status(400).json({ status: 'error', message: 'Le champ "name" doit être une chaîne de 1 à 64 caractères' });
-    }
-    if (image !== undefined && (typeof image !== 'string' || image.length === 0)) {
-        return res.status(400).json({ status: 'error', message: 'Le champ "image" doit être une image encodée en base64' });
     }
     if (!await mayEditFace(req.user, name.trim())) {
         return res.status(403).json(FACE_FORBIDDEN);
     }
-    const result = await vision.addFace(name.trim(), image);
+    const result = await vision.addFace(name.trim());
     if (result.status === 201) {
         console.log(`Visage autorisé ajouté : ${sanitizeForLog(result.json.data.name)}`);
     }
