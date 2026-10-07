@@ -60,6 +60,31 @@ const createVision = (baseUrl, apiKey, previewUrl = baseUrl && previewFrom(baseU
         }
     };
 
+    // Flux MJPEG continu de la webcam (images annotées) : { status, response } ou { status, json }.
+    // `signal` interrompt le flux (déconnexion du client) ; seule la connexion est bornée dans le temps.
+    const stream = async (signal) => {
+        if (!previewUrl) {
+            return { status: 503, json: { status: 'error', message: 'Flux caméra non configuré (VISION_API_URL)' } };
+        }
+        // Un AbortSignal.timeout couperait aussi le corps : délai annulé dès les en-têtes reçus
+        const controller = new AbortController();
+        const onAbort = () => controller.abort();
+        signal.addEventListener('abort', onAbort, { once: true });
+        const connectTimer = setTimeout(onAbort, TIMEOUT_MS);
+        try {
+            const response = await fetch(`${previewUrl}/stream`, { signal: controller.signal });
+            if (!response.ok || !response.body) {
+                controller.abort();
+                return { status: 503, json: { status: 'error', message: 'Aucune image de la caméra pour le moment' } };
+            }
+            return { status: 200, response };
+        } catch {
+            return { status: 503, json: { status: 'error', message: 'Détecteur caméra injoignable' } };
+        } finally {
+            clearTimeout(connectTimer);
+        }
+    };
+
     return {
         enabled,
         status: () => call('/status'),
@@ -67,7 +92,8 @@ const createVision = (baseUrl, apiKey, previewUrl = baseUrl && previewFrom(baseU
         addFace: (name) => call('/faces', { method: 'POST', body: { name } }),
         faceImage: (id) => call(`/faces/${id}/image`),
         deleteFace: (id) => call(`/faces/${id}`, { method: 'DELETE' }),
-        snapshot
+        snapshot,
+        stream
     };
 };
 

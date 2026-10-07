@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const { Readable } = require('stream');
 const helmet = require('helmet');
 const { rateLimit } = require('express-rate-limit');
 const { createStore } = require('./db');
@@ -345,6 +346,27 @@ app.get('/api/v1/camera/snapshot', async (req, res) => {
     res.status(200).type('image/jpeg').set('Cache-Control', 'private, no-store').send(result.image);
 });
 
+// Flux continu de la webcam (MJPEG annoté par l'IA), relayé tel quel tant que le client écoute.
+// Une seule requête pour toute la durée d'affichage : ne pèse pas sur la limite de débit.
+// X-Accel-Buffering : nginx transmet chaque image sans la retenir en tampon.
+app.get('/api/v1/camera/stream', async (req, res) => {
+    const abort = new AbortController();
+    res.on('close', () => abort.abort());
+    const result = await vision.stream(abort.signal);
+    if (!result.response) {
+        return relay(res, result);
+    }
+    res.status(200).set({
+        'Content-Type': result.response.headers.get('content-type'),
+        'Cache-Control': 'private, no-store',
+        'X-Accel-Buffering': 'no'
+    });
+    res.flushHeaders();
+    Readable.fromWeb(result.response.body)
+        .on('error', () => res.destroy())
+        .pipe(res);
+});
+
 // Un visage enregistré sous le nom d'un compte sert à la connexion faciale de ce compte :
 // on ne l'ajoute ou ne le supprime que pour soi-même ou pour un compte qu'on gère
 const mayEditFace = async (actor, name) => {
@@ -457,9 +479,34 @@ const stateCommand = (command, states) => async (req, res) => {
 
 // { state: 'on' | 'off' }
 // Déclenche / arrête l'alarme de l'ESP : buzzer + LED rouge + « ALERT » à l'écran (sorties en auto).
-// Bouton principal de l'écran de pilotage, avec confirmation avant le déclenchement.
-app.post('/api/v1/devices/:id/alert', allow(...ADMINS, 'service'), checkDeviceId,
-    stateCommand('alert', ['on', 'off']));
+// Tout compte peut donner l'alerte ; seuls les admins (et la clé API) l'arrêtent. Une alerte donnée
+// depuis le dashboard est aussi enregistrée (public.alerts, source « dashboard »), même si l'ESP
+// ne répond pas : l'appel à l'aide reste visible des admins.
+app.post('/api/v1/devices/:id/alert', allow(...ROLES, 'service'), checkDeviceId, async (req, res) => {
+    const { state } = req.body || {};
+    if (state !== 'on' && state !== 'off') {
+        return res.status(400).json({ status: 'error', message: 'state : on, off' });
+    }
+    if (state === 'off' && !req.service && !ADMINS.includes(req.user.role)) {
+        return res.status(403).json({ status: 'error', message: "Seul un admin peut arrêter l'alerte" });
+    }
+    const result = await iot.command(req.params.id, 'alert', { state });
+    const actor = req.user ? req.user.username : 'service';
+    console.log(`Commande alert ${state} -> ${req.params.id} par ${sanitizeForLog(actor)} : ${result.status}`);
+    if (state === 'on') {
+        await store.createAlert({
+            deviceId: req.params.id,
+            source: 'dashboard',
+            severity: 'critical',
+            title: `Alerte donnée par ${actor}`,
+            description: result.status === 200
+                ? 'Alarme déclenchée depuis le dashboard (buzzer et LED rouge)'
+                : `Alarme demandée depuis le dashboard, l'appareil ne l'a pas confirmée : ${result.json.message}`,
+            metadata: { by: actor, esp_status: result.status }
+        });
+    }
+    relay(res, result);
+});
 
 // { state: 'on' | 'off' | 'auto' }
 // Bouton à 3 positions (Forcé / Coupé / Auto) ; auto = sonne pendant l'alerte. « off » rend

@@ -19,6 +19,9 @@ const DEVICE_COLUMNS = 'device_id, window_end, status, device_state, reason, ale
 const CAMERA_COLUMNS = 'device_id, updated_at, device_ts, person, identity, names, faces';
 // Le service de détection réécrit l'état d'une caméra au moins toutes les 10 s : au-delà, hors ligne
 const CAMERA_STALE_MS = 30000;
+// Mesures brutes reprises par devices() : âge max (DHT_MAX_AGE_S du service) et fenêtre du gaz
+const READINGS_MAX_AGE_S = 30;
+const GAS_WINDOW_S = 2;
 
 const toAlert = (row) => ({
     id: row.id,
@@ -85,6 +88,33 @@ function createStore(connectionString) {
         return rows[0] ? toAlert(rows[0]) : null;
     };
 
+    // Mesures brutes récentes (hypertable : seuls les derniers morceaux sont lus) par appareil :
+    // Map device_id -> { at, metrics: { temp_last, hum_last, gas_mean } }. Comme le service de
+    // détection : gaz moyen sur 2 s, dernière température / humidité de moins de 30 s.
+    const latestReadings = async () => {
+        const { rows } = await pool.query(
+            `WITH recent AS (
+                 SELECT device_id, received_at, temp, hum, gas_raw FROM detection.sensor_readings
+                 WHERE received_at > now() - interval '${READINGS_MAX_AGE_S} seconds'
+             ), last AS (
+                 SELECT device_id, max(received_at) AS at FROM recent GROUP BY device_id
+             )
+             SELECT l.device_id, l.at,
+                 (SELECT avg(gas_raw) FROM recent r
+                  WHERE r.device_id = l.device_id AND r.received_at > l.at - interval '${GAS_WINDOW_S} seconds') AS gas_mean,
+                 (SELECT temp FROM recent r WHERE r.device_id = l.device_id AND temp IS NOT NULL
+                  ORDER BY received_at DESC LIMIT 1) AS temp_last,
+                 (SELECT hum FROM recent r WHERE r.device_id = l.device_id AND hum IS NOT NULL
+                  ORDER BY received_at DESC LIMIT 1) AS hum_last
+             FROM last l`
+        );
+        const round = (v) => (v === null ? null : Math.round(Number(v) * 10000) / 10000);
+        return new Map(rows.map((r) => [r.device_id, {
+            at: r.at,
+            metrics: { temp_last: round(r.temp_last), hum_last: round(r.hum_last), gas_mean: round(r.gas_mean) }
+        }]));
+    };
+
     return {
         async listAlerts(filters, { offset, limit }) {
             const { where, params } = whereClause(filters);
@@ -96,6 +126,15 @@ function createStore(connectionString) {
             return { data: rows.rows.map(toAlert), total: count.rows[0].total };
         },
         getAlert,
+        // Alerte donnée depuis le dashboard (les autres viennent du service de détection)
+        async createAlert({ deviceId, source, severity, title, description, metadata }) {
+            const { rows } = await pool.query(
+                `INSERT INTO alerts (id, device_id, source, severity, title, description, metadata)
+                 VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6) RETURNING ${ALERT_COLUMNS}`,
+                [deviceId, source, severity, title, description, metadata]
+            );
+            return toAlert(rows[0]);
+        },
         async acknowledgeAlert(id, by) {
             if (!UUID.test(id)) return null;
             const { rows } = await pool.query(
@@ -126,13 +165,26 @@ function createStore(connectionString) {
             }
             return stats;
         },
-        // Dernier état connu de chaque appareil : { device_id: résultat }
+        // Dernier état connu de chaque appareil : { device_id: résultat }. detection.predictions n'est
+        // réécrite qu'au changement d'état ou toutes les 10 s : les mesures (temp_last, hum_last,
+        // gas_mean, mêmes définitions que le service) sont reprises des mesures brutes, plus fraîches.
         async devices() {
-            const { rows } = await pool.query(
-                `SELECT DISTINCT ON (device_id) ${DEVICE_COLUMNS} FROM detection.predictions
-                 ORDER BY device_id, window_end DESC`
-            );
-            return Object.fromEntries(rows.map(r => [r.device_id, toDevice(r)]));
+            const [predictions, readings] = await Promise.all([
+                pool.query(
+                    `SELECT DISTINCT ON (device_id) ${DEVICE_COLUMNS} FROM detection.predictions
+                     ORDER BY device_id, window_end DESC`
+                ),
+                latestReadings()
+            ]);
+            return Object.fromEntries(predictions.rows.map((r) => {
+                const device = toDevice(r);
+                const reading = readings.get(r.device_id);
+                if (reading && reading.at > r.window_end) {
+                    device.timestamp = reading.at.toISOString();
+                    device.metrics = { ...device.metrics, ...reading.metrics };
+                }
+                return [r.device_id, device];
+            }));
         },
         // Caméra la plus récemment vue ; null si aucune n'a publié depuis CAMERA_STALE_MS
         async camera() {
