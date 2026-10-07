@@ -1,9 +1,7 @@
 const express = require('express');
 const cors = require('cors');
-const http = require('http');
 const crypto = require('crypto');
 const helmet = require('helmet');
-const { Server } = require('socket.io');
 const { rateLimit } = require('express-rate-limit');
 const { createStore } = require('./db');
 const { hashPassword, verifyPassword, createSessions } = require('./auth');
@@ -36,11 +34,6 @@ const isAuthorized = (token) =>
     !API_KEY || (typeof token === 'string' && crypto.timingSafeEqual(sha256(token), sha256(API_KEY)));
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: allowedOrigins, methods: ['GET', 'POST'] },
-    maxHttpBufferSize: 10000
-});
 
 // Un seul reverse proxy (nginx) devant l'API : nécessaire pour l'IP réelle du client (rate limit, logs)
 app.set('trust proxy', 1);
@@ -97,7 +90,8 @@ app.get('/api/health', (req, res) => {
     res.status(200).json({ status: 'OK', uptime: process.uptime() });
 });
 
-app.use(rateLimit({ ...limiterOptions, windowMs: 15 * 60 * 1000, limit: 600 }));
+// 10 requêtes/s par IP (comme nginx) : le dashboard interroge l'API en continu (voir frontend live.jsx)
+app.use(rateLimit({ ...limiterOptions, windowMs: 60 * 1000, limit: 600 }));
 // Seul l'ajout d'un visage transporte une image : son corps est lu après l'authentification
 const isFaceUpload = (req) => req.method === 'POST' && req.path === '/api/v1/faces';
 const smallJson = express.json({ limit: '10kb' });
@@ -325,7 +319,6 @@ app.patch('/api/v1/alerts/:id/acknowledge', allow(...ADMINS, 'service'), async (
         return res.status(404).json({ status: 'error', message: 'Alerte non trouvée' });
     }
 
-    io.emit('alert_acknowledged', alert);
     res.status(200).json({ status: 'success', message: 'Alerte acquittée', data: alert });
 });
 
@@ -336,6 +329,15 @@ const checkFaceId = (req, res, next) =>
     FACE_ID.test(req.params.id) ? next() : res.status(404).json({ status: 'error', message: 'Visage non trouvé' });
 
 app.get('/api/v1/camera', async (req, res) => relay(res, await vision.status()));
+
+// Image courante de la webcam (annotée par l'IA) : le dashboard la redemande régulièrement
+app.get('/api/v1/camera/snapshot', async (req, res) => {
+    const result = await vision.snapshot();
+    if (!result.image) {
+        return relay(res, result);
+    }
+    res.status(200).type('image/jpeg').set('Cache-Control', 'private, no-store').send(result.image);
+});
 
 // Un visage enregistré sous le nom d'un compte sert à la connexion faciale de ce compte :
 // on ne l'ajoute ou ne le supprime que pour soi-même ou pour un compte qu'on gère
@@ -399,6 +401,21 @@ app.get('/api/v1/devices', async (req, res) => {
     res.status(200).json({ status: 'success', data: await store.devices() });
 });
 
+// Tout ce que le dashboard affiche en direct, en une seule requête (alertes récentes, états des
+// appareils, stats, identité caméra) : il l'interroge toutes les 0,5 s sans saturer la limite de débit
+app.get('/api/v1/overview', async (req, res) => {
+    const [alerts, devices, stats, camera] = await Promise.all([
+        store.listAlerts({ severities: [], source: '', search: '', since: null }, { offset: 0, limit: 50 }),
+        store.devices(),
+        store.stats(),
+        vision.status()
+    ]);
+    res.status(200).json({
+        status: 'success',
+        data: { alerts: alerts.data, devices, stats, camera: camera.status === 200 ? camera.json.data : null }
+    });
+});
+
 app.get('/api/v1/stats', async (req, res) => {
     res.status(200).json({ status: 'success', data: await store.stats() });
 });
@@ -441,60 +458,6 @@ app.post('/api/v1/iot/reload-model', allow('superadmin'), async (req, res) => {
     relay(res, result);
 });
 
-// WebSocket : même clé que l'API REST, passée par le client (io({ auth: { token } }))
-io.use(async (socket, next) => {
-    const token = socket.handshake.auth?.token;
-    try {
-        if (await accountFromToken(token) || isAuthorized(token)) {
-            return next();
-        }
-    } catch (err) {
-        console.error('❌ Authentification WebSocket:', sanitizeForLog(err.message));
-    }
-    console.warn(`[SÉCURITÉ] WebSocket refusé (ip=${socket.handshake.address})`);
-    next(new Error('Authentification requise'));
-});
-
-// Image en direct de la webcam : le flux du détecteur n'est ouvert que tant qu'au moins un
-// client a rejoint la salle « camera » (camera:watch). volatile : un client lent saute des images.
-let stopCameraStream = null;
-const updateCameraStream = () => {
-    const viewers = io.sockets.adapter.rooms.get('camera')?.size || 0;
-    if (viewers > 0 && !stopCameraStream) {
-        stopCameraStream = vision.stream((jpeg) => io.to('camera').volatile.emit('camera_frame', jpeg));
-    } else if (viewers === 0 && stopCameraStream) {
-        stopCameraStream();
-        stopCameraStream = null;
-    }
-};
-
-io.on('connection', async (socket) => {
-    console.log(`Client WebSocket connecté: ${socket.id}`);
-    socket.on('camera:watch', () => {
-        socket.join('camera');
-        updateCameraStream();
-    });
-    socket.on('camera:unwatch', () => {
-        socket.leave('camera');
-        updateCameraStream();
-    });
-    try {
-        socket.emit('init_alerts', await store.recentAlerts(50));
-        socket.emit('init_devices', await store.devices());
-        const camera = await vision.status();
-        if (camera.status === 200) {
-            socket.emit('init_camera', camera.json.data);
-        }
-    } catch (err) {
-        console.error('❌ État initial indisponible:', sanitizeForLog(err.message));
-    }
-
-    socket.on('disconnect', (reason) => {
-        updateCameraStream();
-        console.log(`Client WebSocket déconnecté: ${socket.id} (${reason})`);
-    });
-});
-
 app.use((req, res) => {
     res.status(404).json({ status: 'error', message: 'Route non trouvée' });
 });
@@ -510,24 +473,9 @@ app.use((err, req, res, next) => {
     res.status(500).json({ status: 'error', message: 'Erreur interne du serveur' });
 });
 
-// Temps réel : nouvelles alertes et états d'appareils écrits en base par le service de détection
-const stopListening = store.listen({
-    onAlert: (alert) => {
-        console.log(`Nouvelle alerte [${alert.severity.toUpperCase()}] :`, sanitizeForLog(alert.title));
-        io.emit('new_alert', alert);
-    },
-    onDevice: (device) => io.emit('device_status', device)
-});
-
-// Temps réel : changements d'identité de la caméra (none / authorized / unknown)
-const stopWatchingCamera = vision.watch((camera) => io.emit('camera_status', camera));
-
 const gracefulShutdown = (signal) => {
     console.log(`Signal ${signal} reçu, arrêt en cours...`);
-    stopWatchingCamera();
-    stopCameraStream?.();
-    io.close();
-    server.close(() => Promise.all([stopListening(), store.close()]).finally(() => process.exit(0)));
+    server.close(() => store.close().finally(() => process.exit(0)));
     setTimeout(() => process.exit(1), 10000).unref();
 };
 
@@ -541,6 +489,6 @@ process.on('unhandledRejection', (reason) => {
     console.error('Promesse rejetée non gérée:', reason);
 });
 
-server.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     console.log(`API Sentinel-X en écoute sur le port ${PORT}`);
 });

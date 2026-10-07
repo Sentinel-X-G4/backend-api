@@ -18,8 +18,7 @@
     "sentinel-x",
     "security",
     "ids",
-    "alerts",
-    "websocket"
+    "alerts"
   ],
   "author": "Sentinel-X Team",
   "license": "ISC",
@@ -33,8 +32,7 @@
     "express": "^5.2.1",
     "express-rate-limit": "^8.7.0",
     "helmet": "^8.3.0",
-    "pg": "^8.23.1",
-    "socket.io": "^4.7.2"
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "eslint": "^8.57.0",

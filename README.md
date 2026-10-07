@@ -1,19 +1,19 @@
 # Sentinel-X Backend API
 
-Backend API pour le système de surveillance SENTINEL-X. Expose une API REST + WebSocket pour l'ingestion, la consultation et le suivi en temps réel des alertes de sécurité.
+Backend API pour le système de surveillance SENTINEL-X. Expose une API REST pour la consultation, l'acquittement et le suivi en direct des alertes de sécurité (le dashboard interroge l'API à intervalle régulier : pas de WebSocket).
 
 ## Points clés
 
 - **Base de données** (`db.js`) : l'API ne se connecte pas à MQTT. Le service de détection
   (`backend-iot-alerts`) écoute le broker et écrit alertes et états d'appareils dans PostgreSQL ;
-  l'API les lit, acquitte les alertes et relaie le temps réel (`LISTEN/NOTIFY`) en WebSocket.
-- **Authentification** : toute l'API (`/api/v1/*` et WebSocket) exige un jeton de session (utilisateurs du
+  l'API les lit et acquitte les alertes. Elle n'a ni WebSocket ni connexion permanente à la base.
+- **Authentification** : toute l'API (`/api/v1/*`) exige un jeton de session (utilisateurs du
   dashboard, `POST /api/v1/auth/login` ou `/auth/face`) ou `API_KEY` (services) en `Authorization: Bearer <jeton>`
-  (WebSocket : `io({ auth: { token } })`). Seuls `GET /api/health` et la connexion sont publics.
+  Seuls `GET /api/health` et la connexion sont publics.
 - **Rôles** (`users.role`) : `superadmin`, `admin`, `user` (le défaut `viewer` de la base vaut `user`).
   Le compte est relu en base à chaque requête : suppression ou changement de rôle immédiats.
 - **Health check** : `GET /api/health` pour la supervision du conteneur.
-- **WebSocket** : push temps réel vers le frontend (Dashboard).
+- **Direct** : le dashboard redemande `GET /api/v1/overview` (alertes récentes, états des appareils, stats et identité caméra en une seule réponse) et `/camera/snapshot` toutes les 0,5 s, soit 4 requêtes par seconde et par onglet.
 
 ## Léquipe
 
@@ -61,8 +61,6 @@ le dépôt `database` (`db/init/`) ; l'API ne crée aucune table.
 |---|---|
 | `public.alerts` | `GET /api/v1/alerts`, `/alerts/:id`, `/stats`, acquittement (`PATCH`) |
 | `detection.predictions` | dernier état de chaque appareil : `GET /api/v1/devices` |
-| `NOTIFY sentinel_alerts` (id) | WebSocket `new_alert` |
-| `NOTIFY sentinel_devices` (device_id) | WebSocket `device_status` |
 
 ## Rôles et droits
 
@@ -111,8 +109,7 @@ clé partagée `VISION_API_KEY`). Le dashboard ne parle qu'au backend, avec la m
 | `POST /api/v1/faces` | `{ "name": "Alice", "image": "data:image/jpeg;base64,…" }` → 201. Sans `image`, le visage est pris sur l'image courante de la caméra. 422 si l'image ne contient pas exactement un visage exploitable (≥ 40 px). Image : 6 Mo max |
 | `GET /api/v1/faces/:id/image` | vignette JPEG du visage (à charger en `fetch` + Bearer, pas en `<img src>`) |
 | `DELETE /api/v1/faces/:id` | supprime le visage |
-| WebSocket `init_camera` / `camera_status` | identité à la connexion, puis à chaque changement |
-| WebSocket `camera:watch` / `camera:unwatch` → `camera_frame` | images JPEG annotées en direct (8 i/s max). Le flux MJPEG du détecteur (port 8089, `VISION_PREVIEW_URL` pour changer) n'est ouvert que tant qu'un client regarde |
+| `GET /api/v1/camera/snapshot` | dernière image JPEG annotée de la webcam (détecteur, port 8089 ; `VISION_PREVIEW_URL` pour changer). Le dashboard la redemande chaque seconde |
 
 Plusieurs photos sous le même `name` améliorent la reconnaissance (lumière, angle, lunettes).
 Détecteur injoignable → 503 ; clé partagée erronée → 502.
@@ -123,8 +120,7 @@ Détecteur injoignable → 503 ; clé partagée erronée → 502.
 - Il n'y a pas d'ingestion HTTP : les alertes arrivent par la base.
 - Sans `API_KEY` (32 caractères minimum), l'API refuse de démarrer en production.
 - Le health check est accessible à `GET /api/health` pour le reverse proxy et la supervision.
-- WebSocket : chemin socket.io par défaut (`/socket.io/`), relayé au backend par le reverse proxy.
-  Il hérite du CORS : `FRONTEND_URL` doit contenir l'origine exacte du dashboard.
+- CORS : `FRONTEND_URL` doit contenir l'origine exacte du dashboard.
 - Historique persistant en base (survit aux redémarrages de l'API).
 
 ## Variables d'environnement (`.env` de `main/`, voir `main/.env.example`)
@@ -133,7 +129,7 @@ Détecteur injoignable → 503 ; clé partagée erronée → 502.
 |---|---|
 | `PORT` | port HTTP (3000 ; 5678 dans la pile Sentinel-X, attendu par le reverse proxy) |
 | `FRONTEND_URL` | origine(s) autorisée(s), séparées par des virgules. Pas de joker : `*` n'est **pas** interprété |
-| `API_KEY` | clé unique REST + WebSocket, obligatoire en production |
+| `API_KEY` | clé des services, obligatoire en production |
 | `DATABASE_URL` | `postgresql://user:pass@db:5432/sentinel`, obligatoire |
 | `VISION_API_URL` | API interne du détecteur caméra (`http://sentinel-human-detection:8090`) ; absente = routes caméra en 503 |
 | `VISION_API_KEY` | clé partagée avec le détecteur (`make vision-api-key` dans `main/`) |
@@ -144,7 +140,7 @@ Dans la pile Sentinel-X, ces variables viennent du `.env` de `main/` (voir le `d
 
 ## Sécurité
 
-Clé d'API obligatoire (comparée en temps constant, refus de démarrer en production si absente), frein au brute-force sur les 401, rate limiting, body limité à 10 Ko (8 Mo pour `POST /api/v1/faces`, lu après l'authentification), CORS restreint, headers sécurisés (helmet), logs anti log-injection, WebSocket limité à 10 Ko, conteneur non-root.
+Clé d'API obligatoire (comparée en temps constant, refus de démarrer en production si absente), frein au brute-force sur les 401, rate limiting (600 requêtes par minute et par IP), body limité à 10 Ko (8 Mo pour `POST /api/v1/faces`, lu après l'authentification), CORS restreint, headers sécurisés (helmet), logs anti log-injection, conteneur non-root.
 
 ## Scripts
 

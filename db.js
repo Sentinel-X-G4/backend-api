@@ -2,19 +2,16 @@
 // Accès à la base Sentinel-X (dépôt database : PostgreSQL / TimescaleDB)
 // ============================================
 // L'API ne parle pas à MQTT : le service de détection (backend-iot-alerts) écoute le broker
-// et écrit en base ; l'API lit, acquitte, et relaie le temps réel en WebSocket.
+// et écrit en base ; l'API lit et acquitte (REST uniquement : le dashboard interroge régulièrement).
 //   public.alerts          alertes (écrites par le service de détection)
 //   detection.predictions  dernier état de chaque appareil
 //   users                  comptes du dashboard (superadmin, admin, user)
-// Temps réel : triggers NOTIFY de database (db/init/03_notify.sql), canaux
-// « sentinel_alerts » (payload = id) et « sentinel_devices » (payload = device_id).
 // Le schéma est créé par database (db/init/) : l'API ne crée aucune table.
 
-const { Client, Pool } = require('pg');
+const { Pool } = require('pg');
 
 const SEVERITIES = ['critical', 'high', 'medium', 'low'];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const CHANNELS = { alerts: 'sentinel_alerts', devices: 'sentinel_devices' };
 
 const ALERT_COLUMNS = 'id, time, source, severity, title, description, metadata, acknowledged, acknowledged_at, acknowledged_by';
 const DEVICE_COLUMNS = 'device_id, window_end, status, device_state, reason, alerts, metrics, model_version';
@@ -72,60 +69,6 @@ function createStore(connectionString) {
         return rows[0] ? toAlert(rows[0]) : null;
     };
 
-    const getDevice = async (deviceId) => {
-        const { rows } = await pool.query(
-            `SELECT ${DEVICE_COLUMNS} FROM detection.predictions WHERE device_id = $1 ORDER BY window_end DESC LIMIT 1`,
-            [deviceId]
-        );
-        return rows[0] ? toDevice(rows[0]) : null;
-    };
-
-    // Connexion dédiée au LISTEN, rouverte avec backoff si la base redémarre.
-    // Les notifications émises pendant une coupure sont perdues : le client se resynchronise en REST.
-    function listen({ onAlert, onDevice }) {
-        let client = null;
-        let stopped = false;
-        let delay = 1000;
-
-        const handle = async ({ channel, payload }) => {
-            try {
-                const item = channel === CHANNELS.alerts ? await getAlert(payload) : await getDevice(payload);
-                if (!item) return;
-                (channel === CHANNELS.alerts ? onAlert : onDevice)(item);
-            } catch (err) {
-                console.error(`❌ Notification ${channel} non traitée:`, err.message);
-            }
-        };
-
-        const connect = async () => {
-            if (stopped) return;
-            client = new Client({ connectionString });
-            client.on('notification', handle);
-            client.on('error', (err) => console.error('❌ PostgreSQL (LISTEN):', err.message));
-            client.on('end', () => {
-                if (stopped) return;
-                console.warn(`⚠️  LISTEN interrompu, reconnexion dans ${delay / 1000} s`);
-                setTimeout(connect, delay);
-                delay = Math.min(delay * 2, 30000);
-            });
-            try {
-                await client.connect();
-                await client.query(`LISTEN ${CHANNELS.alerts}; LISTEN ${CHANNELS.devices}`);
-                delay = 1000;
-                console.log('🗄️  Base connectée : écoute des alertes et des états d\'appareils');
-            } catch (err) {
-                console.error('❌ Connexion LISTEN impossible:', err.message);
-                client.end().catch(() => {});
-            }
-        };
-
-        connect();
-        return () => {
-            stopped = true;
-            return client ? client.end().catch(() => {}) : Promise.resolve();
-        };
-    }
-
     return {
         async listAlerts(filters, { offset, limit }) {
             const { where, params } = whereClause(filters);
@@ -145,10 +88,6 @@ function createStore(connectionString) {
                 [id, by]
             );
             return rows[0] ? toAlert(rows[0]) : null;
-        },
-        async recentAlerts(n) {
-            const { rows } = await pool.query(`SELECT ${ALERT_COLUMNS} FROM alerts ORDER BY time DESC LIMIT $1`, [n]);
-            return rows.map(toAlert);
         },
         async stats() {
             const { rows } = await pool.query(
@@ -221,7 +160,6 @@ function createStore(connectionString) {
         async ping() {
             await pool.query('SELECT 1');
         },
-        listen,
         close: () => pool.end()
     };
 }
