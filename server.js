@@ -72,9 +72,8 @@ const vision = createVision(process.env.VISION_API_URL, process.env.VISION_API_K
 // Service de détection (backend-iot-alerts) : même réseau Docker que la base (sentinel-data)
 const iot = createIot(process.env.DETECTION_API_URL || 'http://sentinel-detection:8000', process.env.DETECTION_ADMIN_TOKEN);
 if (!vision.enabled) {
-    console.warn('VISION_API_URL absente : routes /api/v1/faces et /api/v1/camera indisponibles');
+    console.warn('VISION_API_URL absente : routes /api/v1/faces, /api/v1/camera/snapshot et /api/v1/auth/face indisponibles');
 }
-
 const tooMany = (req, res) => res.status(429).json({ status: 'error', message: 'Trop de requêtes. Réessayez plus tard.' });
 const limiterOptions = { standardHeaders: 'draft-8', legacyHeaders: false, handler: tooMany };
 
@@ -319,13 +318,23 @@ app.patch('/api/v1/alerts/:id/acknowledge', allow(...ADMINS, 'service'), async (
     res.status(200).json({ status: 'success', message: 'Alerte acquittée', data: alert });
 });
 
-// --- Caméra : reconnaissance faciale (relayée vers le détecteur) ------------------------
-// Identité courante : none (personne) | authorized (personne autorisée) | unknown (inconnu)
+// --- Caméra -------------------------------------------------------------------------------
+// Identité courante : dernier état en base (detection.camera_state, écrit par le service de
+// détection à partir du MQTT de la caméra) : none (personne) | authorized (personne autorisée) |
+// unknown (inconnu), names, faces (visages vus : name ou null). 503 si la caméra est hors ligne.
+// Visages autorisés, image et connexion faciale : relayés vers le détecteur (vision.js) ; la
+// connexion faciale y lit l'image en cours, jamais un état en base qui pourrait dater.
 const FACE_ID = /^[0-9a-f]{32}$/;
 const checkFaceId = (req, res, next) =>
     FACE_ID.test(req.params.id) ? next() : res.status(404).json({ status: 'error', message: 'Visage non trouvé' });
 
-app.get('/api/v1/camera', async (req, res) => relay(res, await vision.status()));
+app.get('/api/v1/camera', async (req, res) => {
+    const camera = await store.camera();
+    if (!camera) {
+        return res.status(503).json({ status: 'error', message: 'Caméra hors ligne (aucun état récent)' });
+    }
+    res.status(200).json({ status: 'success', data: camera });
+});
 
 // Image courante de la webcam (annotée par l'IA) : le dashboard la redemande régulièrement
 app.get('/api/v1/camera/snapshot', async (req, res) => {
@@ -395,19 +404,97 @@ app.get('/api/v1/devices', async (req, res) => {
 });
 
 // Tout ce que le dashboard affiche en direct, en une seule requête (alertes récentes, états des
-// appareils, stats, identité caméra) : il l'interroge toutes les 0,5 s sans saturer la limite de débit
+// appareils, stats, identité caméra), lu en base : il l'interroge toutes les 0,5 s sans saturer la
+// limite de débit. camera = null si la caméra est hors ligne (voir GET /api/v1/camera).
 app.get('/api/v1/overview', async (req, res) => {
     const [alerts, devices, stats, camera] = await Promise.all([
         store.listAlerts({ severities: [], source: '', search: '', since: null }, { offset: 0, limit: 50 }),
         store.devices(),
         store.stats(),
-        vision.status()
+        store.camera()
     ]);
-    res.status(200).json({
-        status: 'success',
-        data: { alerts: alerts.data, devices, stats, camera: camera.status === 200 ? camera.json.data : null }
-    });
+    res.status(200).json({ status: 'success', data: { alerts: alerts.data, devices, stats, camera } });
 });
+
+// --- Commandes vers un module ESP -------------------------------------------------------------
+// Relayées au service de détection (iot.js, POST /devices/{id}/...), seul client MQTT des
+// appareils : il publie sur sentinelx/{id}/cmd et attend l'acquittement de l'ESP. La validation
+// est faite ici (messages clairs pour le dashboard) et refaite par le service.
+// Pour le dashboard (pas encore d'écran dédié) :
+//   - réservé aux admins et superadmins (et à la clé API) : masquer ces contrôles pour le rôle user ;
+//   - :id = device_id de GET /api/v1/devices (ex. esp01) ;
+//   - chaque route attend l'acquittement de l'ESP (5 s max) et renvoie l'état de ses sorties :
+//       200 { status: 'success', data: { command, state: { alert, buzzer, led, screen } } }
+//     state sert à afficher l'alerte et le mode courant de chaque sortie ;
+//   - l'ESP ne déclenche plus aucune alerte seul (aucun seuil local) : l'alarme physique ne se
+//     déclenche que par POST …/alert. « auto » = la sortie suit cette alerte ;
+//   - erreurs : 400 corps invalide, 422 refusée par l'ESP, 502 jeton admin du service erroné,
+//     503 service de détection ou broker injoignable, 504 ESP hors ligne (aucun acquittement) :
+//     afficher le message de l'erreur ;
+//   - l'alerte et les modes forcés restent actifs jusqu'au reset ou au redémarrage de l'ESP :
+//     prévoir un bouton « Tout réinitialiser » (POST …/reset) bien visible ;
+//   - l'état n'est pas encore stocké en base (ni dans GET /overview) : il n'est connu qu'au
+//     retour d'une commande (après un rechargement de page, l'afficher comme inconnu).
+const DEVICE_ID = /^[\w.-]{1,64}$/; // jamais de / + # : l'id entre dans un topic MQTT
+const checkDeviceId = (req, res, next) =>
+    DEVICE_ID.test(req.params.id) ? next() : res.status(400).json({ status: 'error', message: 'device_id invalide' });
+const SCREEN_TEXT_MAX = 100;
+
+const sendCommand = async (req, res, command, body) => {
+    const result = await iot.command(req.params.id, command, body);
+    const actor = req.user ? req.user.username : 'service';
+    console.log(`Commande ${command} ${body?.state || ''} -> ${req.params.id} par ${sanitizeForLog(actor)} : ${result.status}`);
+    relay(res, result);
+};
+// Valide body.state parmi `states`, puis envoie la commande
+const stateCommand = (command, states) => async (req, res) => {
+    const { state } = req.body || {};
+    if (!states.includes(state)) {
+        return res.status(400).json({ status: 'error', message: `state : ${states.join(', ')}` });
+    }
+    await sendCommand(req, res, command, { state });
+};
+
+// { state: 'on' | 'off' }
+// Déclenche / arrête l'alarme de l'ESP : buzzer + LED rouge + « ALERT » à l'écran (sorties en auto).
+// Bouton principal de l'écran de pilotage, avec confirmation avant le déclenchement.
+app.post('/api/v1/devices/:id/alert', allow(...ADMINS, 'service'), checkDeviceId,
+    stateCommand('alert', ['on', 'off']));
+
+// { state: 'on' | 'off' | 'auto' }
+// Bouton à 3 positions (Forcé / Coupé / Auto) ; auto = sonne pendant l'alerte. « off » rend
+// l'alerte silencieuse : demander une confirmation dans le dashboard.
+app.post('/api/v1/devices/:id/buzzer', allow(...ADMINS, 'service'), checkDeviceId,
+    stateCommand('buzzer', ['on', 'off', 'auto']));
+
+// { state: 'red' | 'green' | 'both' | 'off' | 'auto' }
+// LED rouge (alerte) et verte (normal) ; auto = rouge pendant l'alerte, verte sinon
+app.post('/api/v1/devices/:id/led', allow(...ADMINS, 'service'), checkDeviceId,
+    stateCommand('led', ['red', 'green', 'both', 'off', 'auto']));
+
+// { state: 'auto' | 'off' } ou { state: 'message', text: '…' }
+// auto = tableau de bord des capteurs, off = écran éteint, message = texte affiché sur l'OLED
+// (100 caractères max, ~21 par ligne ; accents retirés, l'écran n'affiche que l'ASCII)
+app.post('/api/v1/devices/:id/screen', allow(...ADMINS, 'service'), checkDeviceId, async (req, res) => {
+    const { state, text } = req.body || {};
+    if (state === 'auto' || state === 'off') {
+        return sendCommand(req, res, 'screen', { state });
+    }
+    if (state !== 'message') {
+        return res.status(400).json({ status: 'error', message: 'state : auto, off, message' });
+    }
+    const ascii = typeof text === 'string'
+        ? text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\x20-\x7e]/g, ' ').trim()
+        : '';
+    if (ascii.length === 0 || ascii.length > SCREEN_TEXT_MAX) {
+        return res.status(400).json({ status: 'error', message: `text : 1 à ${SCREEN_TEXT_MAX} caractères` });
+    }
+    await sendCommand(req, res, 'screen', { state, text: ascii });
+});
+
+// Sans corps : alerte arrêtée, buzzer, LED et écran en mode auto
+app.post('/api/v1/devices/:id/reset', allow(...ADMINS, 'service'), checkDeviceId,
+    (req, res) => sendCommand(req, res, 'reset'));
 
 app.get('/api/v1/stats', async (req, res) => {
     res.status(200).json({ status: 'success', data: await store.stats() });

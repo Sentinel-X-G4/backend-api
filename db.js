@@ -5,6 +5,7 @@
 // et écrit en base ; l'API lit et acquitte (REST uniquement : le dashboard interroge régulièrement).
 //   public.alerts          alertes (écrites par le service de détection)
 //   detection.predictions  dernier état de chaque appareil
+//   detection.camera_state dernier état de chaque caméra (identité, visages vus)
 //   users                  comptes du dashboard (superadmin, admin, user)
 // Le schéma est créé par database (db/init/) : l'API ne crée aucune table.
 
@@ -15,6 +16,9 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const ALERT_COLUMNS = 'id, time, source, severity, title, description, metadata, acknowledged, acknowledged_at, acknowledged_by';
 const DEVICE_COLUMNS = 'device_id, window_end, status, device_state, reason, alerts, metrics, model_version';
+const CAMERA_COLUMNS = 'device_id, updated_at, device_ts, person, identity, names, faces';
+// Le service de détection réécrit l'état d'une caméra au moins toutes les 10 s : au-delà, hors ligne
+const CAMERA_STALE_MS = 30000;
 
 const toAlert = (row) => ({
     id: row.id,
@@ -39,6 +43,18 @@ const toDevice = (row) => ({
     alerts: row.alerts,
     metrics: row.metrics,
     model_version: row.model_version
+});
+
+// Même forme que GET /status du détecteur (sans boîte ni score des visages) :
+// identity = none | authorized | unknown (null si la reconnaissance faciale est désactivée)
+const toCamera = (row) => ({
+    device_id: row.device_id,
+    identity: row.identity,
+    person: row.person,
+    names: row.names,
+    faces: row.faces,
+    ts: row.device_ts === null ? row.updated_at.getTime() : Number(row.device_ts),
+    updated_at: row.updated_at.toISOString()
 });
 
 const USER_COLUMNS = 'id, username, role';
@@ -117,6 +133,14 @@ function createStore(connectionString) {
                  ORDER BY device_id, window_end DESC`
             );
             return Object.fromEntries(rows.map(r => [r.device_id, toDevice(r)]));
+        },
+        // Caméra la plus récemment vue ; null si aucune n'a publié depuis CAMERA_STALE_MS
+        async camera() {
+            const { rows } = await pool.query(
+                `SELECT ${CAMERA_COLUMNS} FROM detection.camera_state ORDER BY updated_at DESC LIMIT 1`
+            );
+            const row = rows[0];
+            return row && Date.now() - row.updated_at.getTime() <= CAMERA_STALE_MS ? toCamera(row) : null;
         },
         // Comptes du dashboard (table users). Le rôle par défaut de la base (« viewer ») vaut « user ».
         async getUser(username) {

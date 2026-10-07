@@ -5,8 +5,11 @@ Backend API pour le système de surveillance SENTINEL-X. Expose une API REST pou
 ## Points clés
 
 - **Base de données** (`db.js`) : l'API ne se connecte pas à MQTT. Le service de détection
-  (`backend-iot-alerts`) écoute le broker et écrit alertes et états d'appareils dans PostgreSQL ;
-  l'API les lit et acquitte les alertes. Elle n'a ni WebSocket ni connexion permanente à la base.
+  (`backend-iot-alerts`), seul à parler aux capteurs et à la caméra, écoute le broker et écrit
+  alertes et états d'appareils dans PostgreSQL ; l'API les lit et acquitte les alertes. Elle n'a ni
+  WebSocket ni connexion permanente à la base.
+- **Seule porte du frontend** : base de données et API du service de détection (santé,
+  entraînement, commandes ESP) ne sont exposées au dashboard que par cette API.
 - **Authentification** : toute l'API (`/api/v1/*`) exige un jeton de session (utilisateurs du
   dashboard, `POST /api/v1/auth/login` ou `/auth/face`) ou `API_KEY` (services) en `Authorization: Bearer <jeton>`
   Seuls `GET /api/health` et la connexion sont publics.
@@ -61,6 +64,7 @@ le dépôt `database` (`db/init/`) ; l'API ne crée aucune table.
 |---|---|
 | `public.alerts` | `GET /api/v1/alerts`, `/alerts/:id`, `/stats`, acquittement (`PATCH`) |
 | `detection.predictions` | dernier état de chaque appareil : `GET /api/v1/devices` |
+| `detection.camera_state` | dernier état de la caméra (identité, visages vus) : `GET /api/v1/camera`, `camera` de `/overview` ; `null` / 503 si aucun état depuis 30 s |
 
 ## Rôles et droits
 
@@ -73,6 +77,7 @@ le dépôt `database` (`db/init/`) ; l'API ne crée aucune table.
 | Visages autorisés `/faces` | | ✓ | ✓ |
 | Comptes `/users` (`GET`, `POST`, `PATCH /:id`, `DELETE /:id`) | | comptes `user` | tous |
 | Santé du service de détection `GET /iot/health` | | ✓ | ✓ |
+| Commandes ESP `POST /devices/:id/{alert,buzzer,led,screen,reset}` (aussi avec `API_KEY`) | | ✓ | ✓ |
 | Entraînement : `/iot/recording`, `/iot/recording/start\|stop`, `POST /iot/reload-model` | | | ✓ |
 
 Personne ne modifie ni ne supprime son propre compte par `/users` (seulement son mot de passe par
@@ -97,14 +102,55 @@ Relayé vers son API (`iot.js`, `http://sentinel-detection:8000` par le réseau 
 | `POST /api/v1/iot/recording/stop` | `{ device_id? }` (toutes si absent) |
 | `POST /api/v1/iot/reload-model` | recharge le modèle (`DETECTION_ADMIN_TOKEN` si le service en exige un) |
 
+## Commandes vers les ESP
+
+Relayées au service de détection (`iot.js` → `POST /devices/{device_id}/…`, jeton
+`DETECTION_ADMIN_TOKEN`), seul client MQTT des appareils : il publie sur `sentinelx/{device_id}/cmd`
+(QoS 1) et attend l'acquittement de l'ESP sur `sentinelx/{device_id}/ack` (même `id`, 5 s max).
+Validation faite ici (messages clairs pour le dashboard) puis refaite par le service. L'ESP ne déclenche aucune alerte seul (pas
+de seuil local) : son alarme ne se déclenche que par `POST …/alert`. `auto` = la sortie suit cette
+alerte. Alerte et modes forcés restent actifs jusqu'au `reset` ou au redémarrage de l'ESP.
+
+| Route | Corps |
+|---|---|
+| `POST /api/v1/devices/:id/alert` | `{ "state": "on" \| "off" }` : buzzer + LED rouge + « ALERT » à l'écran (sorties en `auto`) |
+| `POST /api/v1/devices/:id/buzzer` | `{ "state": "on" \| "off" \| "auto" }` (`off` rend l'alerte silencieuse) |
+| `POST /api/v1/devices/:id/led` | `{ "state": "red" \| "green" \| "both" \| "off" \| "auto" }` |
+| `POST /api/v1/devices/:id/screen` | `{ "state": "auto" \| "off" }` ou `{ "state": "message", "text": "…" }` (100 caractères max, accents retirés) |
+| `POST /api/v1/devices/:id/reset` | aucun : alerte arrêtée, tout revient en `auto` |
+
+Réponse : `200 { status: "success", data: { command, state: { alert, buzzer, led, screen } } }` (état
+après la commande). Erreurs : `400` corps ou `device_id` invalide, `422` refusée par l'ESP, `502` jeton
+admin du service erroné, `503` service de détection ou broker injoignable, `504` aucun acquittement
+(ESP hors ligne).
+
+```bash
+curl -X POST https://dashboard.sentinel.lan/api/v1/devices/esp01/screen \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"state":"message","text":"Evacuation salle B"}'
+```
+
+Message MQTT publié par le service de détection : `{"id": "<uuid>", "command": "alert" | "buzzer" | "led" | "screen" | "reset", "state"?, "text"?}` ;
+acquittement : `{"id", "command", "ok", "error"?, "state": {"alert", "buzzer", "led", "screen"}}`
+(firmware : `software/src/main.cpp`, `handleCommand`).
+
+**Dashboard (à construire)** : contrôles réservés aux admins ; bouton principal « Déclencher
+l'alerte » (`alert`, avec confirmation), « Tout réinitialiser » (`reset`) bien visible ;
+confirmation avant de couper le buzzer. L'état des sorties n'est connu qu'au
+retour d'une commande (pas encore en base).
+
 ## Caméra : reconnaissance faciale
 
-Relayée vers l'API interne du détecteur (`human-detection-ia`, réseau Docker `sentinel-vision`,
-clé partagée `VISION_API_KEY`). Le dashboard ne parle qu'au backend, avec la même clé que le reste.
+L'identité courante vient de la base : la caméra la publie en MQTT, le service de détection
+l'enregistre (`detection.camera_state`, à chaque changement et au moins toutes les 10 s).
+Visages autorisés, image et connexion faciale sont relayés vers l'API interne du détecteur
+(`human-detection-ia`, réseau Docker `sentinel-vision`, clé partagée `VISION_API_KEY`) : la
+connexion faciale lit l'image en cours, jamais un état en base qui pourrait dater. Le dashboard ne
+parle qu'au backend, avec la même clé que le reste.
 
 | Route | Rôle |
 |---|---|
-| `GET /api/v1/camera` | identité courante : `identity` = `none` (personne) \| `authorized` (personne autorisée) \| `unknown` (inconnu), `names` (autorisés reconnus), `faces` (visages vus : `name` ou `null`, `score`, `box`) |
+| `GET /api/v1/camera` | identité courante (base) : `identity` = `none` (personne) \| `authorized` (personne autorisée) \| `unknown` (inconnu), `person`, `names` (autorisés reconnus), `faces` (visages vus : `name` ou `null`), `device_id`, `ts`, `updated_at`. 503 si aucun état depuis 30 s (caméra hors ligne) |
 | `GET /api/v1/faces` | visages autorisés : `[{ id, name, created_at }]` |
 | `POST /api/v1/faces` | `{ "name": "Alice" }` → 201. Le détecteur prend le visage sur l'image courante de la caméra Sentinel : le backend ne reçoit aucune image. 422 s'il n'y a pas exactement un visage exploitable (≥ 40 px) |
 | `GET /api/v1/faces/:id/image` | vignette JPEG du visage (à charger en `fetch` + Bearer, pas en `<img src>`) |
@@ -116,7 +162,8 @@ Détecteur injoignable → 503 ; clé partagée erronée → 502.
 
 ## Points d'intégration
 
-- Le service de détection et l'ESP passent par **MQTT** ; seul le service de détection y est abonné.
+- Le service de détection et l'ESP passent par **MQTT** ; seul le service de détection y est connecté
+  (mesures, caméra, commandes vers les ESP). L'API lui parle en HTTP (`iot.js`).
 - Il n'y a pas d'ingestion HTTP : les alertes arrivent par la base.
 - Sans `API_KEY` (32 caractères minimum), l'API refuse de démarrer en production.
 - Le health check est accessible à `GET /api/health` pour le reverse proxy et la supervision.
@@ -134,7 +181,8 @@ Détecteur injoignable → 503 ; clé partagée erronée → 502.
 | `VISION_API_URL` | API interne du détecteur caméra (`http://sentinel-human-detection:8090`) ; absente = routes caméra en 503 |
 | `VISION_API_KEY` | clé partagée avec le détecteur (`make vision-api-key` dans `main/`) |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | compte superadmin initial (voir Rôles et droits) |
-| `DETECTION_API_URL`, `DETECTION_ADMIN_TOKEN`, `VISION_PREVIEW_URL` | facultatives : les valeurs par défaut conviennent à la pile Docker ; à définir pour `npm run dev` hors Docker (`http://localhost:8000`, `http://localhost:8089`) |
+| `DETECTION_ADMIN_TOKEN` | jeton des routes d'action du service de détection (commandes ESP, rechargement du modèle) ; `make detection-admin-token` dans `main/` |
+| `DETECTION_API_URL`, `VISION_PREVIEW_URL` | facultatives : les valeurs par défaut conviennent à la pile Docker ; à définir pour `npm run dev` hors Docker (`http://localhost:8000`, `http://localhost:8089`) |
 
 Dans la pile Sentinel-X, ces variables viennent du `.env` de `main/` (voir le `docker-compose.yml` de `main`, seul compose du projet) ; le backend n'a pas de `.env` propre. `npm run dev` charge `../../.env`.
 
