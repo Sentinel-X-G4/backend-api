@@ -3,8 +3,48 @@
 // sentinel-vision ; le dashboard passe toujours par ce backend (même clé, même rate limit).
 
 const TIMEOUT_MS = 10000;
+const MAX_FRAME_BYTES = 2 * 1024 * 1024;
 
-const createVision = (baseUrl, apiKey) => {
+// Flux annoté du détecteur (MJPEG, port 8089, réseau sentinel-vision) : VISION_PREVIEW_URL,
+// sinon même hôte que l'API interne sur le port 8089
+const previewFrom = (baseUrl) => {
+    try {
+        const url = new URL(baseUrl);
+        url.port = '8089';
+        return url.origin;
+    } catch {
+        return null;
+    }
+};
+
+// Découpe un flux multipart/x-mixed-replace en images JPEG (chaque partie porte Content-Length)
+async function readMjpeg(body, onFrame, signal) {
+    const reader = body.getReader();
+    let buffer = Buffer.alloc(0);
+    while (!signal.aborted) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        buffer = Buffer.concat([buffer, Buffer.from(value)]);
+        for (;;) {
+            const headerEnd = buffer.indexOf('\r\n\r\n');
+            if (headerEnd < 0) break;
+            const match = /Content-Length:\s*(\d+)/i.exec(buffer.subarray(0, headerEnd).toString('latin1'));
+            if (!match) {
+                buffer = buffer.subarray(headerEnd + 4);
+                continue;
+            }
+            const length = Number(match[1]);
+            if (length > MAX_FRAME_BYTES) throw new Error('image trop volumineuse');
+            const start = headerEnd + 4;
+            if (buffer.length < start + length) break;
+            onFrame(Buffer.from(buffer.subarray(start, start + length)));
+            buffer = buffer.subarray(start + length);
+        }
+        if (buffer.length > MAX_FRAME_BYTES * 2) buffer = Buffer.alloc(0);
+    }
+}
+
+const createVision = (baseUrl, apiKey, previewUrl = baseUrl && previewFrom(baseUrl)) => {
     const enabled = Boolean(baseUrl);
 
     const call = async (path, { method = 'GET', body } = {}) => {
@@ -55,8 +95,45 @@ const createVision = (baseUrl, apiKey) => {
         return () => clearInterval(timer);
     };
 
+    // Image en direct de la webcam : un seul flux ouvert vers le détecteur tant que quelqu'un
+    // regarde, images limitées à maxFps, reconnexion avec backoff. Renvoie la fonction d'arrêt.
+    const stream = (onFrame, maxFps = 8) => {
+        if (!previewUrl) {
+            return () => {};
+        }
+        const controller = new AbortController();
+        const minGap = 1000 / maxFps;
+        let lastSent = 0;
+        let delay = 1000;
+        const run = async () => {
+            while (!controller.signal.aborted) {
+                try {
+                    const res = await fetch(`${previewUrl}/stream`, { signal: controller.signal });
+                    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+                    delay = 1000;
+                    await readMjpeg(res.body, (jpeg) => {
+                        const now = Date.now();
+                        if (now - lastSent >= minGap) {
+                            lastSent = now;
+                            onFrame(jpeg);
+                        }
+                    }, controller.signal);
+                } catch {
+                    // flux coupé ou détecteur absent : on réessaie
+                }
+                if (controller.signal.aborted) return;
+                await new Promise((resolve) => setTimeout(resolve, delay).unref());
+                delay = Math.min(delay * 2, 15000);
+            }
+        };
+        run();
+        return () => controller.abort();
+    };
+
     return {
         enabled,
+        streaming: Boolean(previewUrl),
+        stream,
         status: () => call('/status'),
         listFaces: () => call('/faces'),
         addFace: (name, image) => call('/faces', { method: 'POST', body: { name, ...(image && { image }) } }),

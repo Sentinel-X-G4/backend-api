@@ -7,8 +7,11 @@ Backend API pour le système de surveillance SENTINEL-X. Expose une API REST + W
 - **Base de données** (`db.js`) : l'API ne se connecte pas à MQTT. Le service de détection
   (`backend-iot-alerts`) écoute le broker et écrit alertes et états d'appareils dans PostgreSQL ;
   l'API les lit, acquitte les alertes et relaie le temps réel (`LISTEN/NOTIFY`) en WebSocket.
-- **Authentification** : toute l'API (`/api/v1/*` et WebSocket) exige `API_KEY` en `Authorization: Bearer <clé>`
-  (WebSocket : `io({ auth: { token } })`). Seul `GET /api/health` est public.
+- **Authentification** : toute l'API (`/api/v1/*` et WebSocket) exige un jeton de session (utilisateurs du
+  dashboard, `POST /api/v1/auth/login` ou `/auth/face`) ou `API_KEY` (services) en `Authorization: Bearer <jeton>`
+  (WebSocket : `io({ auth: { token } })`). Seuls `GET /api/health` et la connexion sont publics.
+- **Rôles** (`users.role`) : `superadmin`, `admin`, `user` (le défaut `viewer` de la base vaut `user`).
+  Le compte est relu en base à chaque requête : suppression ou changement de rôle immédiats.
 - **Health check** : `GET /api/health` pour la supervision du conteneur.
 - **WebSocket** : push temps réel vers le frontend (Dashboard).
 
@@ -61,6 +64,41 @@ le dépôt `database` (`db/init/`) ; l'API ne crée aucune table.
 | `NOTIFY sentinel_alerts` (id) | WebSocket `new_alert` |
 | `NOTIFY sentinel_devices` (device_id) | WebSocket `device_status` |
 
+## Rôles et droits
+
+| Fonction | user | admin | superadmin |
+|---|:-:|:-:|:-:|
+| Supervision : alertes, stats, appareils, caméra (identité + flux vidéo) | ✓ | ✓ | ✓ |
+| Mon compte : `GET /auth/me`, `PATCH /auth/password` | ✓ | ✓ | ✓ |
+| Connexion faciale `POST /auth/face` | ✓ | ✓ | — (mot de passe obligatoire) |
+| Acquitter une alerte (aussi avec `API_KEY`) | | ✓ | ✓ |
+| Visages autorisés `/faces` | | ✓ | ✓ |
+| Comptes `/users` (`GET`, `POST`, `PATCH /:id`, `DELETE /:id`) | | comptes `user` | tous |
+| Santé du service de détection `GET /iot/health` | | ✓ | ✓ |
+| Entraînement : `/iot/recording`, `/iot/recording/start\|stop`, `POST /iot/reload-model` | | | ✓ |
+
+Personne ne modifie ni ne supprime son propre compte par `/users` (seulement son mot de passe par
+`/auth/password`) : il reste donc toujours au moins un superadmin. Premier démarrage : le compte
+`ADMIN_USERNAME` / `ADMIN_PASSWORD` est créé superadmin ; sur une base sans superadmin, il est promu.
+
+**Connexion faciale** : `POST /api/v1/auth/face { username }` ouvre une session si la caméra voit à cet
+instant **un seul** visage, reconnu sous le nom du compte. Un visage nommé comme un compte ne peut donc
+être ajouté ou supprimé que par ce compte ou par quelqu'un qui le gère (un admin ne peut pas enregistrer
+son visage sous le nom d'un superadmin).
+
+## Service de détection (backend-iot-alerts)
+
+Relayé vers son API (`iot.js`, `http://sentinel-detection:8000` par le réseau `sentinel-data`,
+`DETECTION_API_URL` pour changer). Service injoignable → 503.
+
+| Route | Rôle |
+|---|---|
+| `GET /api/v1/iot/health` | santé : MQTT, base, modèle, dernière mesure par appareil |
+| `GET /api/v1/iot/recording` | sessions d'enregistrement en cours |
+| `POST /api/v1/iot/recording/start` | `{ device_id, label, notes? }`, label : `aucune`, `presence`, `fuite_gaz`, `feu` (combinables avec `+`) |
+| `POST /api/v1/iot/recording/stop` | `{ device_id? }` (toutes si absent) |
+| `POST /api/v1/iot/reload-model` | recharge le modèle (`DETECTION_ADMIN_TOKEN` si le service en exige un) |
+
 ## Caméra : reconnaissance faciale
 
 Relayée vers l'API interne du détecteur (`human-detection-ia`, réseau Docker `sentinel-vision`,
@@ -74,6 +112,7 @@ clé partagée `VISION_API_KEY`). Le dashboard ne parle qu'au backend, avec la m
 | `GET /api/v1/faces/:id/image` | vignette JPEG du visage (à charger en `fetch` + Bearer, pas en `<img src>`) |
 | `DELETE /api/v1/faces/:id` | supprime le visage |
 | WebSocket `init_camera` / `camera_status` | identité à la connexion, puis à chaque changement |
+| WebSocket `camera:watch` / `camera:unwatch` → `camera_frame` | images JPEG annotées en direct (8 i/s max). Le flux MJPEG du détecteur (port 8089, `VISION_PREVIEW_URL` pour changer) n'est ouvert que tant qu'un client regarde |
 
 Plusieurs photos sous le même `name` améliorent la reconnaissance (lumière, angle, lunettes).
 Détecteur injoignable → 503 ; clé partagée erronée → 502.
@@ -98,6 +137,8 @@ Détecteur injoignable → 503 ; clé partagée erronée → 502.
 | `DATABASE_URL` | `postgresql://user:pass@db:5432/sentinel`, obligatoire |
 | `VISION_API_URL` | API interne du détecteur caméra (`http://sentinel-human-detection:8090`) ; absente = routes caméra en 503 |
 | `VISION_API_KEY` | clé partagée avec le détecteur (`make vision-api-key` dans `main/`) |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | compte superadmin initial (voir Rôles et droits) |
+| `DETECTION_API_URL`, `DETECTION_ADMIN_TOKEN`, `VISION_PREVIEW_URL` | facultatives : les valeurs par défaut conviennent à la pile Docker ; à définir pour `npm run dev` hors Docker (`http://localhost:8000`, `http://localhost:8089`) |
 
 Dans la pile Sentinel-X, ces variables viennent du `.env` de `main/` (voir le `docker-compose.yml` de `main`, seul compose du projet) ; le backend n'a pas de `.env` propre. `npm run dev` charge `../../.env`.
 

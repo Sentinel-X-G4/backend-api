@@ -5,6 +5,7 @@
 // et écrit en base ; l'API lit, acquitte, et relaie le temps réel en WebSocket.
 //   public.alerts          alertes (écrites par le service de détection)
 //   detection.predictions  dernier état de chaque appareil
+//   users                  comptes du dashboard (superadmin, admin, user)
 // Temps réel : triggers NOTIFY de database (db/init/03_notify.sql), canaux
 // « sentinel_alerts » (payload = id) et « sentinel_devices » (payload = device_id).
 // Le schéma est créé par database (db/init/) : l'API ne crée aucune table.
@@ -42,6 +43,9 @@ const toDevice = (row) => ({
     metrics: row.metrics,
     model_version: row.model_version
 });
+
+const USER_COLUMNS = 'id, username, role';
+const toUser = (row) => ({ id: row.id, username: row.username, role: row.role === 'viewer' ? 'user' : row.role });
 
 // Filtres de GET /api/v1/alerts : sous-chaînes insensibles à la casse, sans motif LIKE
 function whereClause({ severities, source, search, since }) {
@@ -175,14 +179,18 @@ function createStore(connectionString) {
             );
             return Object.fromEntries(rows.map(r => [r.device_id, toDevice(r)]));
         },
-        // Comptes du dashboard (table users)
+        // Comptes du dashboard (table users). Le rôle par défaut de la base (« viewer ») vaut « user ».
         async getUser(username) {
-            const { rows } = await pool.query('SELECT username, password_hash, role FROM users WHERE username = $1', [username]);
-            return rows[0] || null;
+            const { rows } = await pool.query(`SELECT ${USER_COLUMNS}, password_hash FROM users WHERE username = $1`, [username]);
+            return rows[0] ? { ...toUser(rows[0]), password_hash: rows[0].password_hash } : null;
+        },
+        async getUserById(id) {
+            const { rows } = await pool.query(`SELECT ${USER_COLUMNS} FROM users WHERE id = $1`, [id]);
+            return rows[0] ? toUser(rows[0]) : null;
         },
         async listUsers() {
-            const { rows } = await pool.query('SELECT id, username, role FROM users ORDER BY id');
-            return rows;
+            const { rows } = await pool.query(`SELECT ${USER_COLUMNS} FROM users ORDER BY id`);
+            return rows.map(toUser);
         },
         async countUsers() {
             const { rows } = await pool.query('SELECT count(*)::int AS n FROM users');
@@ -192,10 +200,23 @@ function createStore(connectionString) {
         async createUser(username, passwordHash, role) {
             const { rows } = await pool.query(
                 `INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3)
-                 ON CONFLICT (username) DO NOTHING RETURNING id, username, role`,
+                 ON CONFLICT (username) DO NOTHING RETURNING ${USER_COLUMNS}`,
                 [username, passwordHash, role]
             );
-            return rows[0] || null;
+            return rows[0] ? toUser(rows[0]) : null;
+        },
+        // changes : { role?, passwordHash? } -> compte mis à jour ou null
+        async updateUser(id, { role, passwordHash }) {
+            const { rows } = await pool.query(
+                `UPDATE users SET role = COALESCE($2, role), password_hash = COALESCE($3, password_hash)
+                 WHERE id = $1 RETURNING ${USER_COLUMNS}`,
+                [id, role ?? null, passwordHash ?? null]
+            );
+            return rows[0] ? toUser(rows[0]) : null;
+        },
+        async deleteUser(id) {
+            const { rowCount } = await pool.query('DELETE FROM users WHERE id = $1', [id]);
+            return rowCount > 0;
         },
         async ping() {
             await pool.query('SELECT 1');
