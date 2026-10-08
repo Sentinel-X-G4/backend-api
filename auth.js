@@ -2,6 +2,8 @@
 const crypto = require('crypto');
 
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+// Compte sans mot de passe (connexion par visage uniquement) : valeur qu'aucun mot de passe ne vérifie
+const NO_PASSWORD = 'none';
 
 function hashPassword(password) {
     const salt = crypto.randomBytes(16);
@@ -45,4 +47,4 @@ function createSessions(secret) {
     };
 }
 
-module.exports = { hashPassword, verifyPassword, createSessions };
+module.exports = { NO_PASSWORD, hashPassword, verifyPassword, createSessions };

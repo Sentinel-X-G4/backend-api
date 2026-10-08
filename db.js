@@ -60,8 +60,14 @@ const toCamera = (row) => ({
     updated_at: row.updated_at.toISOString()
 });
 
-const USER_COLUMNS = 'id, username, role';
-const toUser = (row) => ({ id: row.id, username: row.username, role: row.role === 'viewer' ? 'user' : row.role });
+// has_password : faux pour un compte sans mot de passe (connexion par visage uniquement, auth.js)
+const USER_COLUMNS = `id, username, role, password_hash LIKE 'scrypt$%' AS has_password`;
+const toUser = (row) => ({
+    id: row.id,
+    username: row.username,
+    role: row.role === 'viewer' ? 'user' : row.role,
+    hasPassword: row.has_password
+});
 
 // Filtres de GET /api/v1/alerts : sous-chaînes insensibles à la casse, sans motif LIKE
 function whereClause({ severities, source, search, since }) {

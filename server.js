@@ -5,7 +5,7 @@ const { Readable } = require('stream');
 const helmet = require('helmet');
 const { rateLimit } = require('express-rate-limit');
 const { createStore } = require('./db');
-const { hashPassword, verifyPassword, createSessions } = require('./auth');
+const { NO_PASSWORD, hashPassword, verifyPassword, createSessions } = require('./auth');
 const { createVision } = require('./vision');
 const { createIot } = require('./iot');
 
@@ -112,12 +112,18 @@ const authFailureLimiter = rateLimit({
 });
 
 const relay = (res, { status, json }) => res.status(status).json(json);
-const publicAccount = (user) => ({ id: user.id, username: user.username, role: user.role });
+const publicAccount = (user) => ({ id: user.id, username: user.username, role: user.role, hasPassword: user.hasPassword });
 const sessionResponse = (res, user) => {
     const account = publicAccount(user);
     res.status(200).json({ status: 'success', data: { token: sessions.issue(account), user: account } });
 };
 const FACE_LOGIN_REFUSED = { status: 'error', message: 'Visage non reconnu pour ce compte' };
+// Motif d'échec de la connexion faciale (dernière image vue), sans jamais nommer qui a été reconnu
+const FACE_LOGIN_REASONS = {
+    none: 'Aucun visage vu par la caméra Sentinel : placez-vous face à elle',
+    several: 'Plusieurs visages vus par la caméra Sentinel : placez-vous seul face à elle',
+    other: FACE_LOGIN_REFUSED.message
+};
 
 // Connexion : publique (frein au brute-force via authFailureLimiter), renvoie un jeton de session
 app.post('/api/v1/auth/login', authFailureLimiter, async (req, res) => {
@@ -129,22 +135,51 @@ app.post('/api/v1/auth/login', authFailureLimiter, async (req, res) => {
     sessionResponse(res, user);
 });
 
-// Connexion par reconnaissance faciale : l'identifiant doit correspondre au SEUL visage que la
-// caméra voit à cet instant (visage enregistré sous le nom du compte). Les superadmins gardent
-// le mot de passe obligatoire.
+// Connexion par reconnaissance faciale : sur 2,5 s au plus, la caméra doit voir 3 images où le
+// SEUL visage présent est celui du compte (visage enregistré sous son identifiant). Une seule
+// image ne suffit pas : la détection d'un visage varie d'une image à l'autre (clignement, angle).
+const FACE_LOGIN_FRAMES = 3;
+const FACE_LOGIN_WINDOW_MS = 2500;
+const FACE_LOGIN_POLL_MS = 150;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// -> { matched: true } | { matched: false, reason } ou réponse d'erreur du détecteur ({ status, json })
+const faceMatches = async (username) => {
+    const deadline = Date.now() + FACE_LOGIN_WINDOW_MS;
+    let matches = 0;
+    let lastFrame = null;
+    let reason = 'none';
+    while (Date.now() < deadline) {
+        const camera = await vision.status();
+        if (camera.status !== 200) {
+            return camera;
+        }
+        const { faces = [], ts } = camera.json.data;
+        // ts change à chaque image analysée : une même image n'est comptée qu'une fois
+        if (ts !== lastFrame) {
+            reason = faces.length === 0 ? 'none' : faces.length > 1 ? 'several' : 'other';
+            if (faces.length === 1 && faces[0].name === username && ++matches >= FACE_LOGIN_FRAMES) {
+                return { matched: true };
+            }
+        }
+        lastFrame = ts;
+        await sleep(FACE_LOGIN_POLL_MS);
+    }
+    return { matched: false, reason };
+};
+
 app.post('/api/v1/auth/face', authFailureLimiter, async (req, res) => {
     const { username } = req.body || {};
     const user = typeof username === 'string' ? await store.getUser(username) : null;
-    if (!user || user.role === 'superadmin') {
+    if (!user) {
         return res.status(401).json(FACE_LOGIN_REFUSED);
     }
-    const camera = await vision.status();
-    if (camera.status !== 200) {
-        return relay(res, camera);
+    const result = await faceMatches(user.username);
+    if (result.matched === undefined) {
+        return relay(res, result);
     }
-    const faces = camera.json.data.faces || [];
-    if (faces.length !== 1 || faces[0].name !== user.username) {
-        return res.status(401).json(FACE_LOGIN_REFUSED);
+    if (!result.matched) {
+        return res.status(401).json({ status: 'error', message: FACE_LOGIN_REASONS[result.reason] });
     }
     console.log(`Connexion par visage : ${sanitizeForLog(user.username)}`);
     sessionResponse(res, user);
@@ -225,6 +260,8 @@ const roleRefused = (actor) => ({ status: 'error', message: `Rôle non autorisé
 
 const validPassword = (password) => typeof password === 'string' && password.length >= 8 && password.length <= 200;
 const PASSWORD_ERROR = { status: 'error', message: 'Mot de passe : 8 à 200 caractères' };
+// Un compte sans mot de passe ne se connecte que par visage : interdit pour un superadmin
+const SUPERADMIN_PASSWORD = { status: 'error', message: 'Un super admin doit avoir un mot de passe' };
 
 // Mon compte : identité et rôle à jour (le dashboard adapte ses menus), changement de mot de passe
 app.get('/api/v1/auth/me', allow(...ROLES), (req, res) => {
@@ -234,7 +271,8 @@ app.get('/api/v1/auth/me', allow(...ROLES), (req, res) => {
 app.patch('/api/v1/auth/password', allow(...ROLES), async (req, res) => {
     const { currentPassword, newPassword } = req.body || {};
     const user = await store.getUser(req.user.username);
-    if (typeof currentPassword !== 'string' || !verifyPassword(currentPassword, user.password_hash)) {
+    // Compte sans mot de passe (visage uniquement) : il en définit un sans mot de passe actuel
+    if (user.hasPassword && (typeof currentPassword !== 'string' || !verifyPassword(currentPassword, user.password_hash))) {
         return res.status(400).json({ status: 'error', message: 'Mot de passe actuel incorrect' });
     }
     if (!validPassword(newPassword)) {
@@ -254,13 +292,17 @@ app.post('/api/v1/users', allow(...ADMINS), async (req, res) => {
     if (typeof username !== 'string' || !/^[\w.@-]{3,50}$/.test(username)) {
         return res.status(400).json({ status: 'error', message: 'Identifiant invalide (3 à 50 caractères : lettres, chiffres, . _ @ -)' });
     }
-    if (!validPassword(password)) {
+    // Sans mot de passe : connexion par visage uniquement (visage enregistré sous cet identifiant)
+    if (password !== undefined && !validPassword(password)) {
         return res.status(400).json(PASSWORD_ERROR);
     }
     if (!assignableRoles(req.user).includes(role)) {
         return res.status(403).json(roleRefused(req.user));
     }
-    const user = await store.createUser(username, hashPassword(password), role);
+    if (password === undefined && role === 'superadmin') {
+        return res.status(400).json(SUPERADMIN_PASSWORD);
+    }
+    const user = await store.createUser(username, password === undefined ? NO_PASSWORD : hashPassword(password), role);
     if (!user) {
         return res.status(409).json({ status: 'error', message: 'Cet identifiant existe déjà' });
     }
@@ -293,6 +335,9 @@ app.patch('/api/v1/users/:id', allow(...ADMINS), loadTarget, async (req, res) =>
     }
     if (password !== undefined && !validPassword(password)) {
         return res.status(400).json(PASSWORD_ERROR);
+    }
+    if (role === 'superadmin' && password === undefined && !req.target.hasPassword) {
+        return res.status(400).json(SUPERADMIN_PASSWORD);
     }
     const user = await store.updateUser(req.target.id, { role, passwordHash: password && hashPassword(password) });
     console.log(`Compte modifié : ${sanitizeForLog(user.username)} (${user.role}) par ${sanitizeForLog(req.user.username)}`);

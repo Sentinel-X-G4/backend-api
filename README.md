@@ -72,7 +72,7 @@ le dépôt `database` (`db/init/`) ; l'API ne crée aucune table.
 |---|:-:|:-:|:-:|
 | Supervision : alertes, stats, appareils, caméra (identité + flux vidéo) | ✓ | ✓ | ✓ |
 | Mon compte : `GET /auth/me`, `PATCH /auth/password` | ✓ | ✓ | ✓ |
-| Connexion faciale `POST /auth/face` | ✓ | ✓ | — (mot de passe obligatoire) |
+| Connexion faciale `POST /auth/face` | ✓ | ✓ | ✓ |
 | Acquitter une alerte (aussi avec `API_KEY`) | | ✓ | ✓ |
 | Visages autorisés `/faces` | | ✓ | ✓ |
 | Comptes `/users` (`GET`, `POST`, `PATCH /:id`, `DELETE /:id`) | | comptes `user` | tous |
@@ -84,8 +84,12 @@ Personne ne modifie ni ne supprime son propre compte par `/users` (seulement son
 `/auth/password`) : il reste donc toujours au moins un superadmin. Premier démarrage : le compte
 `ADMIN_USERNAME` / `ADMIN_PASSWORD` est créé superadmin ; sur une base sans superadmin, il est promu.
 
-**Connexion faciale** : `POST /api/v1/auth/face { username }` ouvre une session si la caméra voit à cet
-instant **un seul** visage, reconnu sous le nom du compte. Un visage nommé comme un compte ne peut donc
+**Connexion faciale** : `POST /api/v1/auth/face { username }` ouvre une session si, en 2,5 s au plus,
+la caméra voit 3 images avec **un seul** visage, reconnu sous le nom du compte. En cas d'échec, le
+message dit si aucun visage, plusieurs visages ou un autre visage a été vu (sans jamais le nommer).
+Un compte peut n'avoir **aucun mot de passe** (`POST /users` sans `password`) : il ne se connecte que
+par visage et peut en définir un ensuite (`PATCH /auth/password` sans `currentPassword`) ; interdit
+pour un superadmin. `hasPassword` dans les comptes renvoyés indique lequel des deux cas. Un visage nommé comme un compte ne peut donc
 être ajouté ou supprimé que par ce compte ou par quelqu'un qui le gère (un admin ne peut pas enregistrer
 son visage sous le nom d'un superadmin).
 `GET /api/v1/auth/face/stream` (public, sans session) : le flux annoté de la caméra Sentinel pour la page
