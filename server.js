@@ -150,6 +150,41 @@ app.post('/api/v1/auth/face', authFailureLimiter, async (req, res) => {
     sessionResponse(res, user);
 });
 
+// Relaie le flux MJPEG du détecteur tant que le client écoute.
+// X-Accel-Buffering : nginx transmet chaque image sans la retenir en tampon.
+const relayCameraStream = async (req, res) => {
+    const abort = new AbortController();
+    res.on('close', () => abort.abort());
+    const result = await vision.stream(abort.signal);
+    if (!result.response) {
+        return relay(res, result);
+    }
+    res.status(200).set({
+        'Content-Type': result.response.headers.get('content-type'),
+        'Cache-Control': 'private, no-store',
+        'X-Accel-Buffering': 'no'
+    });
+    res.flushHeaders();
+    Readable.fromWeb(result.response.body)
+        .on('error', () => res.destroy())
+        .pipe(res);
+};
+
+// Retour caméra de la page de connexion faciale (dashboard) : même flux annoté que
+// /camera/stream, public puisqu'il n'y a pas encore de session, donc borné : 2 aperçus
+// simultanés au plus pour tout le serveur, 120 ouvertures par IP et par quart d'heure.
+const LOGIN_PREVIEW_MAX = 2;
+let loginPreviews = 0;
+const loginPreviewLimiter = rateLimit({ ...limiterOptions, windowMs: 15 * 60 * 1000, limit: 120 });
+app.get('/api/v1/auth/face/stream', loginPreviewLimiter, async (req, res) => {
+    if (loginPreviews >= LOGIN_PREVIEW_MAX) {
+        return res.status(503).json({ status: 'error', message: 'Aperçu caméra déjà utilisé, réessayez dans un instant' });
+    }
+    loginPreviews++;
+    res.on('close', () => { loginPreviews--; });
+    await relayCameraStream(req, res);
+});
+
 // Jeton de session -> compte relu en base : un compte supprimé ou dont le rôle change est
 // pris en compte immédiatement, sans attendre l'expiration du jeton
 const accountFromToken = async (token) => {
@@ -348,24 +383,7 @@ app.get('/api/v1/camera/snapshot', async (req, res) => {
 
 // Flux continu de la webcam (MJPEG annoté par l'IA), relayé tel quel tant que le client écoute.
 // Une seule requête pour toute la durée d'affichage : ne pèse pas sur la limite de débit.
-// X-Accel-Buffering : nginx transmet chaque image sans la retenir en tampon.
-app.get('/api/v1/camera/stream', async (req, res) => {
-    const abort = new AbortController();
-    res.on('close', () => abort.abort());
-    const result = await vision.stream(abort.signal);
-    if (!result.response) {
-        return relay(res, result);
-    }
-    res.status(200).set({
-        'Content-Type': result.response.headers.get('content-type'),
-        'Cache-Control': 'private, no-store',
-        'X-Accel-Buffering': 'no'
-    });
-    res.flushHeaders();
-    Readable.fromWeb(result.response.body)
-        .on('error', () => res.destroy())
-        .pipe(res);
-});
+app.get('/api/v1/camera/stream', (req, res) => relayCameraStream(req, res));
 
 // Un visage enregistré sous le nom d'un compte sert à la connexion faciale de ce compte :
 // on ne l'ajoute ou ne le supprime que pour soi-même ou pour un compte qu'on gère

@@ -88,6 +88,8 @@ Personne ne modifie ni ne supprime son propre compte par `/users` (seulement son
 instant **un seul** visage, reconnu sous le nom du compte. Un visage nommé comme un compte ne peut donc
 être ajouté ou supprimé que par ce compte ou par quelqu'un qui le gère (un admin ne peut pas enregistrer
 son visage sous le nom d'un superadmin).
+`GET /api/v1/auth/face/stream` (public, sans session) : le flux annoté de la caméra Sentinel pour la page
+de connexion, comme `/camera/stream` ; 2 aperçus simultanés au plus, 120 ouvertures par IP / 15 min.
 
 ## Service de détection (backend-iot-alerts)
 
