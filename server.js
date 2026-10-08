@@ -90,8 +90,9 @@ app.get('/api/health', (req, res) => {
     res.status(200).json({ status: 'OK', uptime: process.uptime() });
 });
 
-// 10 requêtes/s par IP (comme nginx) : le dashboard interroge l'API en continu (voir frontend live.jsx)
-app.use(rateLimit({ ...limiterOptions, windowMs: 60 * 1000, limit: 600 }));
+// 30 requêtes/s par IP (comme nginx) : le dashboard interroge l'API en continu (voir frontend live.jsx),
+// et derrière Docker Desktop tous les navigateurs peuvent arriver avec la même IP
+app.use(rateLimit({ ...limiterOptions, windowMs: 60 * 1000, limit: 1800 }));
 app.use(express.json({ limit: '10kb' }));
 
 // Nettoyage avant logging (anti log-injection : CR/LF/tab -> espace)
@@ -397,6 +398,15 @@ app.patch('/api/v1/alerts/:id/acknowledge', allow(...ADMINS, 'service'), async (
     }
 
     res.status(200).json({ status: 'success', message: 'Alerte acquittée', data: alert });
+});
+
+// Suppression d'une alerte : superadmin uniquement
+app.delete('/api/v1/alerts/:id', allow('superadmin'), async (req, res) => {
+    if (!await store.deleteAlert(req.params.id)) {
+        return res.status(404).json({ status: 'error', message: 'Alerte non trouvée' });
+    }
+    console.log(`Alerte ${sanitizeForLog(req.params.id)} supprimée par ${sanitizeForLog(req.user.username)}`);
+    res.status(200).json({ status: 'success', message: 'Alerte supprimée' });
 });
 
 // --- Caméra -------------------------------------------------------------------------------

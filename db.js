@@ -150,6 +150,12 @@ function createStore(connectionString) {
             );
             return rows[0] ? toAlert(rows[0]) : null;
         },
+        // -> true si l'alerte existait
+        async deleteAlert(id) {
+            if (!UUID.test(id)) return false;
+            const { rowCount } = await pool.query('DELETE FROM alerts WHERE id = $1', [id]);
+            return rowCount > 0;
+        },
         async stats() {
             const { rows } = await pool.query(
                 `SELECT severity, source, count(*)::int AS n, count(*) FILTER (WHERE acknowledged)::int AS acked
