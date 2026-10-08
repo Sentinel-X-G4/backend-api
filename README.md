@@ -16,7 +16,7 @@ Backend API pour le système de surveillance SENTINEL-X. Expose une API REST pou
 - **Rôles** (`users.role`) : `superadmin`, `admin`, `user` (le défaut `viewer` de la base vaut `user`).
   Le compte est relu en base à chaque requête : suppression ou changement de rôle immédiats.
 - **Health check** : `GET /api/health` pour la supervision du conteneur.
-- **Direct** : le dashboard redemande `GET /api/v1/overview` (alertes récentes, états des appareils, stats et identité caméra en une seule réponse) et `/camera/snapshot` toutes les 0,5 s, soit 4 requêtes par seconde et par onglet.
+- **Direct** : le dashboard redemande `GET /api/v1/overview` (alertes récentes, états des appareils, stats et identité caméra en une seule réponse) toutes les 0,5 s, soit 2 requêtes par seconde et par onglet ; l'image de la caméra arrive par un seul flux continu (`/camera/stream`).
 
 ## Léquipe
 
@@ -140,7 +140,9 @@ Message MQTT publié par le service de détection : `{"id": "<uuid>", "command":
 acquittement : `{"id", "command", "ok", "error"?, "state": {"alert", "buzzer", "led", "screen"}}`
 (firmware : `software/src/main.cpp`, `handleCommand`).
 
-**Dashboard** : les contrôles sont sur la page Supervision (`frontend-dashboard/src/pages/Overview.jsx`).
+**Dashboard** : la page Supervision (`frontend-dashboard/src/pages/Overview.jsx`) n'utilise que
+`alert` (« Donner l'alerte », « Arrêter l'alerte ») ; `buzzer`, `led`, `screen` et `reset` ne sont
+accessibles que par l'API.
 L'état des sorties n'est connu qu'au retour d'une commande (pas encore en base).
 
 ## Caméra : reconnaissance faciale
@@ -159,7 +161,8 @@ parle qu'au backend, avec la même clé que le reste.
 | `POST /api/v1/faces` | `{ "name": "Alice" }` → 201. Le détecteur prend le visage sur l'image courante de la caméra Sentinel : le backend ne reçoit aucune image. 422 s'il n'y a pas exactement un visage exploitable (≥ 40 px) |
 | `GET /api/v1/faces/:id/image` | vignette JPEG du visage (à charger en `fetch` + Bearer, pas en `<img src>`) |
 | `DELETE /api/v1/faces/:id` | supprime le visage |
-| `GET /api/v1/camera/snapshot` | dernière image JPEG annotée de la webcam (détecteur, port 8089 ; `VISION_PREVIEW_URL` pour changer). Le dashboard la redemande chaque seconde |
+| `GET /api/v1/camera/snapshot` | dernière image JPEG annotée de la webcam (détecteur, port 8089 ; `VISION_PREVIEW_URL` pour changer). Le dashboard ne l'utilise plus : il lit `/camera/stream` |
+| `GET /api/v1/camera/stream` | flux MJPEG continu annoté, relayé tant que le client écoute (tous les rôles) |
 
 Plusieurs captures sous le même `name` améliorent la reconnaissance (lumière, angle, lunettes).
 Détecteur injoignable → 503 ; clé partagée erronée → 502.

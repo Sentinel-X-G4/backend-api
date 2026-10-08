@@ -14,7 +14,7 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY;
 const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173').split(',').map(u => u.trim()).filter(Boolean);
 
-// Une seule clé protège toute l'API (REST + WebSocket). En production elle est obligatoire
+// Clé des services (et secret des jetons de session, auth.js). En production elle est obligatoire
 // et doit être générée : openssl rand -hex 32
 if (isProduction && (!API_KEY || API_KEY.length < 32)) {
     console.error('[SÉCURITÉ] API_KEY absente ou trop courte (32 caractères minimum) : arrêt');
