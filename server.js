@@ -615,7 +615,7 @@ app.get('/api/v1/stats', async (req, res) => {
 app.get('/api/v1/iot/health', allow(...ADMINS), async (req, res) => relay(res, await iot.health()));
 
 // Sessions d'enregistrement étiquetées : jeu d'entraînement du modèle
-const RECORDING_LABEL = /^(aucune|presence|fuite_gaz|feu)(\+(presence|fuite_gaz|feu))*$/;
+const RECORDING_LABEL = /^(aucune|presence|fuite_gaz|feu|inondation)(\+(presence|fuite_gaz|feu|inondation))*$/;
 app.get('/api/v1/iot/recording', allow('superadmin'), async (req, res) => relay(res, await iot.recordings()));
 
 app.post('/api/v1/iot/recording/start', allow('superadmin'), async (req, res) => {
@@ -624,7 +624,7 @@ app.post('/api/v1/iot/recording/start', allow('superadmin'), async (req, res) =>
         return res.status(400).json({ status: 'error', message: 'device_id invalide' });
     }
     if (typeof label !== 'string' || !RECORDING_LABEL.test(label)) {
-        return res.status(400).json({ status: 'error', message: 'label : aucune, presence, fuite_gaz, feu (combinables avec +)' });
+        return res.status(400).json({ status: 'error', message: 'label : aucune, presence, fuite_gaz, feu, inondation (combinables avec +)' });
     }
     if (notes !== undefined && (typeof notes !== 'string' || notes.length > 500)) {
         return res.status(400).json({ status: 'error', message: 'notes : 500 caractères maximum' });

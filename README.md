@@ -104,7 +104,7 @@ Relayé vers son API (`iot.js`, `http://sentinel-detection:8000` par le réseau 
 |---|---|
 | `GET /api/v1/iot/health` | santé : MQTT, base, modèle, dernière mesure par appareil |
 | `GET /api/v1/iot/recording` | sessions d'enregistrement en cours |
-| `POST /api/v1/iot/recording/start` | `{ device_id, label, notes? }`, label : `aucune`, `presence`, `fuite_gaz`, `feu` (combinables avec `+`) |
+| `POST /api/v1/iot/recording/start` | `{ device_id, label, notes? }`, label : `aucune`, `presence`, `fuite_gaz`, `feu`, `inondation` (combinables avec `+`) |
 | `POST /api/v1/iot/recording/stop` | `{ device_id? }` (toutes si absent) |
 | `POST /api/v1/iot/reload-model` | recharge le modèle (`DETECTION_ADMIN_TOKEN` si le service en exige un) |
 
