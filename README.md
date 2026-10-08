@@ -140,10 +140,8 @@ Message MQTT publié par le service de détection : `{"id": "<uuid>", "command":
 acquittement : `{"id", "command", "ok", "error"?, "state": {"alert", "buzzer", "led", "screen"}}`
 (firmware : `software/src/main.cpp`, `handleCommand`).
 
-**Dashboard (à construire)** : contrôles réservés aux admins ; bouton principal « Déclencher
-l'alerte » (`alert`, avec confirmation), « Tout réinitialiser » (`reset`) bien visible ;
-confirmation avant de couper le buzzer. L'état des sorties n'est connu qu'au
-retour d'une commande (pas encore en base).
+**Dashboard** : les contrôles sont sur la page Supervision (`frontend-dashboard/src/pages/Overview.jsx`).
+L'état des sorties n'est connu qu'au retour d'une commande (pas encore en base).
 
 ## Caméra : reconnaissance faciale
 
@@ -194,7 +192,7 @@ Dans la pile Sentinel-X, ces variables viennent du `.env` de `main/` (voir le `d
 
 ## Sécurité
 
-Clé d'API obligatoire (comparée en temps constant, refus de démarrer en production si absente), frein au brute-force sur les 401, rate limiting (600 requêtes par minute et par IP), body limité à 10 Ko, CORS restreint, headers sécurisés (helmet), logs anti log-injection, conteneur non-root.
+Clé d'API obligatoire (comparée en temps constant, refus de démarrer en production si absente), frein au brute-force sur les 401, rate limiting (1 800 requêtes par minute et par IP, soit 30/s comme nginx), body limité à 10 Ko, CORS restreint, headers sécurisés (helmet), logs anti log-injection, conteneur non-root.
 
 ## Scripts
 
